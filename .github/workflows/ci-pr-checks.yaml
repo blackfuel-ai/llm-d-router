@@ -8,9 +8,11 @@ on:
     branches:
       - main
       - 'release-*'
+      - 'bf/**'
   pull_request:
     branches:
       - main
+      - 'bf/**'
   merge_group:
     types: [checks_requested]
 
