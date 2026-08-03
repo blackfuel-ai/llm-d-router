@@ -64,14 +64,25 @@ type EvictChannelLookup interface {
 	Deregister(requestID string)
 }
 
-// EnvMirrorBestEffort designates this EPP as serving a request-mirror (shadow) pool whose
-// filter runs inline on the primary request stream. In FULL_DUPLEX_STREAMED mode Envoy has
-// already handed the request body to the EPP, so any ImmediateResponse or stream error tears
-// down the PRIMARY request, not just the shadow copy. A best-effort EPP therefore converts
-// routing failures (no endpoints, flow-control eviction) into a normal exchange with no
-// endpoint pick: Envoy continues the primary request and the shadow clone, lacking a
-// destination, is dropped. Set by bf-operator on per-mirror EPP deployments only.
-const EnvMirrorBestEffort = "EPP_MIRROR_BEST_EFFORT"
+// EnvRoutingFailureMode selects how the EPP treats a routing failure — a request it could
+// not place on an endpoint (no candidate pods, flow-control rejection or eviction):
+//
+//   - "fail-closed" (default): reject the request with an ImmediateResponse.
+//   - "fail-open": complete the ext_proc exchange with no endpoint pick — a header response
+//     carrying no mutation plus the body echo — so the proxy continues the request; the
+//     EPP's decision becomes best-effort and it never fails the request stream (in-flight
+//     evictions close the stream gracefully instead of sending 429).
+//
+// fail-open exists for deployments whose ext_proc filter runs inline on a request stream it
+// must not be able to kill — e.g. an EPP serving a request-mirror (shadow) pool: in
+// FULL_DUPLEX_STREAMED mode the proxy has already handed the request body to the EPP, so an
+// ImmediateResponse or stream error tears down the PRIMARY request, not just the shadow copy
+// (which, lacking a destination header, is simply dropped).
+const EnvRoutingFailureMode = "EPP_ROUTING_FAILURE_MODE"
+
+// RoutingFailureModeFailOpen is the EnvRoutingFailureMode value enabling fail-open; any
+// other value (including unset) is fail-closed.
+const RoutingFailureModeFailOpen = "fail-open"
 
 func NewStreamingServer(datastore Datastore, director Director, parserRegistry *ParserRegistry, maxPoolBufferSize int) *StreamingServer {
 	return &StreamingServer{
@@ -79,7 +90,7 @@ func NewStreamingServer(datastore Datastore, director Director, parserRegistry *
 		datastore:         datastore,
 		parserRegistry:    parserRegistry,
 		maxPoolBufferSize: maxPoolBufferSize,
-		mirrorBestEffort:  os.Getenv(EnvMirrorBestEffort) == "true",
+		routingFailOpen:   os.Getenv(EnvRoutingFailureMode) == RoutingFailureModeFailOpen,
 		bufferPool: sync.Pool{
 			New: func() any {
 				return new(bytes.Buffer)
@@ -88,9 +99,9 @@ func NewStreamingServer(datastore Datastore, director Director, parserRegistry *
 	}
 }
 
-// SetMirrorBestEffort overrides the EPP_MIRROR_BEST_EFFORT designation (tests).
-func (s *StreamingServer) SetMirrorBestEffort(enabled bool) {
-	s.mirrorBestEffort = enabled
+// SetRoutingFailureMode overrides the EPP_ROUTING_FAILURE_MODE designation (tests).
+func (s *StreamingServer) SetRoutingFailureMode(mode string) {
+	s.routingFailOpen = mode == RoutingFailureModeFailOpen
 }
 
 // isRoutingFailure reports whether err is a failure to place the request on an endpoint —
@@ -104,11 +115,12 @@ func isRoutingFailure(err error) bool {
 	return false
 }
 
-// sendBestEffortContinue completes the ext_proc exchange with no endpoint pick: a header
+// sendFailOpenContinue completes the ext_proc exchange with no endpoint pick: a header
 // response carrying no mutation, followed by the duplex body echo when a body was received.
-// Envoy continues the request as if the filter were a no-op; a request-mirror clone that
-// depends on the (absent) endpoint header cannot resolve its cluster and is dropped.
-func sendBestEffortContinue(srv extProcPb.ExternalProcessor_ProcessServer, rawBody []byte) error {
+// The proxy continues the request as if the filter were a no-op; anything that depends on
+// the (absent) endpoint header — e.g. a request-mirror clone resolving its cluster from it —
+// is dropped.
+func sendFailOpenContinue(srv extProcPb.ExternalProcessor_ProcessServer, rawBody []byte) error {
 	headerResp := &extProcPb.ProcessingResponse{
 		Response: &extProcPb.ProcessingResponse_RequestHeaders{
 			RequestHeaders: &extProcPb.HeadersResponse{},
@@ -152,9 +164,9 @@ type StreamingServer struct {
 	evictionLookup    EvictChannelLookup // optional, set for eviction support
 	bufferPool        sync.Pool
 	maxPoolBufferSize int
-	// mirrorBestEffort: this EPP serves a request-mirror pool; routing failures must never
-	// fail the request stream (see EnvMirrorBestEffort).
-	mirrorBestEffort bool
+	// routingFailOpen: routing failures complete with no endpoint pick instead of rejecting
+	// the request; the EPP never fails the request stream (see EnvRoutingFailureMode).
+	routingFailOpen bool
 }
 
 // RequestContext stores context information during the life time of an HTTP request.
@@ -411,12 +423,12 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				evictCh = nil // prevent closed channel from firing repeatedly
 				continue
 			}
-			// A mirror best-effort EPP must not evict in-flight requests with an
-			// ImmediateResponse — it would reset the PRIMARY request stream its duplex
-			// filter is inline on. Close the ext_proc stream gracefully instead; the
-			// request proceeds with whatever pick was already communicated.
-			if s.mirrorBestEffort {
-				logger.Info("Mirror best-effort: ignoring flow-control eviction", "requestID", evictionRequestID)
+			// fail-open: an in-flight eviction must not send an ImmediateResponse — it
+			// would reset the request stream this filter is inline on. Close the
+			// ext_proc stream gracefully instead; the request proceeds with whatever
+			// pick was already communicated.
+			if s.routingFailOpen {
+				logger.Info("Routing fail-open: ignoring flow-control eviction", "requestID", evictionRequestID)
 				return nil
 			}
 			// Eviction triggered — transition to evicted state and let the state machine send the response.
@@ -579,13 +591,13 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			} else {
 				logger.Error(err, "Failed to process request")
 			}
-			// A mirror best-effort EPP converts routing failures into a normal exchange
-			// with no endpoint pick: an ImmediateResponse here would fail the PRIMARY
-			// request its duplex filter is inline on (see EnvMirrorBestEffort). Only
-			// routing failures qualify — request errors (4xx) still reject.
-			if s.mirrorBestEffort && isRoutingFailure(err) {
-				logger.Info("Mirror best-effort: continuing without endpoint pick", "cause", err.Error())
-				if sendErr := sendBestEffortContinue(srv, reqCtx.Request.RawBody); sendErr != nil {
+			// fail-open: complete the exchange with no endpoint pick instead of an
+			// ImmediateResponse, which would fail the request stream this filter is
+			// inline on (see EnvRoutingFailureMode). Only routing failures qualify —
+			// request errors (4xx) still reject.
+			if s.routingFailOpen && isRoutingFailure(err) {
+				logger.Info("Routing fail-open: continuing without endpoint pick", "cause", err.Error())
+				if sendErr := sendFailOpenContinue(srv, reqCtx.Request.RawBody); sendErr != nil {
 					logger.Error(sendErr, "Send failed")
 					return status.Errorf(codes.Unknown, "failed to send response back to Envoy: %v", sendErr)
 				}

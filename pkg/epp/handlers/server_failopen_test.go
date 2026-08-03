@@ -26,22 +26,22 @@ import (
 	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
 )
 
-func TestNewStreamingServer_MirrorBestEffortFromEnv(t *testing.T) {
+func TestNewStreamingServer_RoutingFailureModeFromEnv(t *testing.T) {
 	tests := []struct {
 		name string
 		env  string
 		want bool
 	}{
-		{name: "enabled", env: "true", want: true},
-		{name: "disabled", env: "false", want: false},
-		{name: "unset", env: "", want: false},
-		{name: "garbage", env: "yes", want: false},
+		{name: "fail-open", env: "fail-open", want: true},
+		{name: "fail-closed", env: "fail-closed", want: false},
+		{name: "unset defaults to fail-closed", env: "", want: false},
+		{name: "boolean-looking value is not a mode", env: "true", want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv(EnvMirrorBestEffort, tt.env)
+			t.Setenv(EnvRoutingFailureMode, tt.env)
 			s := NewStreamingServer(nil, nil, nil, 0)
-			assert.Equal(t, tt.want, s.mirrorBestEffort)
+			assert.Equal(t, tt.want, s.routingFailOpen)
 		})
 	}
 }
@@ -82,15 +82,15 @@ func TestIsRoutingFailure(t *testing.T) {
 	}
 }
 
-// TestSendBestEffortContinue_WithBody: the continue exchange is a header response with no
+// TestSendFailOpenContinue_WithBody: the continue exchange is a header response with no
 // endpoint pick (no header mutation, no dynamic metadata) followed by the duplex body echo
-// ending with EndOfStream — the shape Envoy needs to resume the primary request untouched.
-func TestSendBestEffortContinue_WithBody(t *testing.T) {
+// ending with EndOfStream — the shape the proxy needs to resume the request untouched.
+func TestSendFailOpenContinue_WithBody(t *testing.T) {
 	t.Parallel()
 	srv := &mockProcessServer{}
 	body := bytes.Repeat([]byte("x"), 70000) // > one 62000-byte chunk, forces multi-chunk echo
 
-	require.NoError(t, sendBestEffortContinue(srv, body))
+	require.NoError(t, sendFailOpenContinue(srv, body))
 	require.GreaterOrEqual(t, len(srv.sentResponses), 3, "header response + at least two body chunks")
 
 	headerResp := srv.sentResponses[0].GetRequestHeaders()
@@ -114,11 +114,11 @@ func TestSendBestEffortContinue_WithBody(t *testing.T) {
 	assert.Equal(t, body, echoed, "body must be echoed verbatim")
 }
 
-func TestSendBestEffortContinue_NoBody(t *testing.T) {
+func TestSendFailOpenContinue_NoBody(t *testing.T) {
 	t.Parallel()
 	srv := &mockProcessServer{}
 
-	require.NoError(t, sendBestEffortContinue(srv, nil))
+	require.NoError(t, sendFailOpenContinue(srv, nil))
 	require.Len(t, srv.sentResponses, 1, "header response only when no body was received")
 	require.NotNil(t, srv.sentResponses[0].GetRequestHeaders())
 }
