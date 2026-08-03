@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -63,18 +64,67 @@ type EvictChannelLookup interface {
 	Deregister(requestID string)
 }
 
+// EnvMirrorBestEffort designates this EPP as serving a request-mirror (shadow) pool whose
+// filter runs inline on the primary request stream. In FULL_DUPLEX_STREAMED mode Envoy has
+// already handed the request body to the EPP, so any ImmediateResponse or stream error tears
+// down the PRIMARY request, not just the shadow copy. A best-effort EPP therefore converts
+// routing failures (no endpoints, flow-control eviction) into a normal exchange with no
+// endpoint pick: Envoy continues the primary request and the shadow clone, lacking a
+// destination, is dropped. Set by bf-operator on per-mirror EPP deployments only.
+const EnvMirrorBestEffort = "EPP_MIRROR_BEST_EFFORT"
+
 func NewStreamingServer(datastore Datastore, director Director, parserRegistry *ParserRegistry, maxPoolBufferSize int) *StreamingServer {
 	return &StreamingServer{
 		director:          director,
 		datastore:         datastore,
 		parserRegistry:    parserRegistry,
 		maxPoolBufferSize: maxPoolBufferSize,
+		mirrorBestEffort:  os.Getenv(EnvMirrorBestEffort) == "true",
 		bufferPool: sync.Pool{
 			New: func() any {
 				return new(bytes.Buffer)
 			},
 		},
 	}
+}
+
+// SetMirrorBestEffort overrides the EPP_MIRROR_BEST_EFFORT designation (tests).
+func (s *StreamingServer) SetMirrorBestEffort(enabled bool) {
+	s.mirrorBestEffort = enabled
+}
+
+// isRoutingFailure reports whether err is a failure to place the request on an endpoint —
+// no candidate pods (ServiceUnavailable) or flow-control rejection/eviction
+// (ResourceExhausted) — as opposed to a request error the client must see.
+func isRoutingFailure(err error) bool {
+	switch errcommon.CanonicalCode(err) {
+	case errcommon.ServiceUnavailable, errcommon.ResourceExhausted:
+		return true
+	}
+	return false
+}
+
+// sendBestEffortContinue completes the ext_proc exchange with no endpoint pick: a header
+// response carrying no mutation, followed by the duplex body echo when a body was received.
+// Envoy continues the request as if the filter were a no-op; a request-mirror clone that
+// depends on the (absent) endpoint header cannot resolve its cluster and is dropped.
+func sendBestEffortContinue(srv extProcPb.ExternalProcessor_ProcessServer, rawBody []byte) error {
+	headerResp := &extProcPb.ProcessingResponse{
+		Response: &extProcPb.ProcessingResponse_RequestHeaders{
+			RequestHeaders: &extProcPb.HeadersResponse{},
+		},
+	}
+	if err := srv.Send(headerResp); err != nil {
+		return err
+	}
+	if len(rawBody) > 0 {
+		for _, resp := range envoy.GenerateRequestBodyResponses(rawBody) {
+			if err := srv.Send(resp); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // SetEvictChannelLookup sets the eviction channel lookup for eviction support.
@@ -102,6 +152,9 @@ type StreamingServer struct {
 	evictionLookup    EvictChannelLookup // optional, set for eviction support
 	bufferPool        sync.Pool
 	maxPoolBufferSize int
+	// mirrorBestEffort: this EPP serves a request-mirror pool; routing failures must never
+	// fail the request stream (see EnvMirrorBestEffort).
+	mirrorBestEffort bool
 }
 
 // RequestContext stores context information during the life time of an HTTP request.
@@ -358,6 +411,14 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				evictCh = nil // prevent closed channel from firing repeatedly
 				continue
 			}
+			// A mirror best-effort EPP must not evict in-flight requests with an
+			// ImmediateResponse — it would reset the PRIMARY request stream its duplex
+			// filter is inline on. Close the ext_proc stream gracefully instead; the
+			// request proceeds with whatever pick was already communicated.
+			if s.mirrorBestEffort {
+				logger.Info("Mirror best-effort: ignoring flow-control eviction", "requestID", evictionRequestID)
+				return nil
+			}
 			// Eviction triggered — transition to evicted state and let the state machine send the response.
 			logger.Info("Request evicted by flow control", "requestID", evictionRequestID)
 			reqCtx.RequestState = RequestEvicted
@@ -517,6 +578,18 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				logger.V(logutil.DEBUG).Error(err, "Failed to process request", "request", req)
 			} else {
 				logger.Error(err, "Failed to process request")
+			}
+			// A mirror best-effort EPP converts routing failures into a normal exchange
+			// with no endpoint pick: an ImmediateResponse here would fail the PRIMARY
+			// request its duplex filter is inline on (see EnvMirrorBestEffort). Only
+			// routing failures qualify — request errors (4xx) still reject.
+			if s.mirrorBestEffort && isRoutingFailure(err) {
+				logger.Info("Mirror best-effort: continuing without endpoint pick", "cause", err.Error())
+				if sendErr := sendBestEffortContinue(srv, reqCtx.Request.RawBody); sendErr != nil {
+					logger.Error(sendErr, "Send failed")
+					return status.Errorf(codes.Unknown, "failed to send response back to Envoy: %v", sendErr)
+				}
+				return nil
 			}
 			resp, err := errcommon.BuildErrResponse(err)
 			if err != nil {
