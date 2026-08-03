@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -63,18 +64,79 @@ type EvictChannelLookup interface {
 	Deregister(requestID string)
 }
 
+// EnvRoutingFailureMode selects how the EPP treats a routing failure — a request it could
+// not place on an endpoint (no candidate pods, flow-control rejection or eviction):
+//
+//   - "fail-closed" (default): reject the request with an ImmediateResponse.
+//   - "fail-open": complete the ext_proc exchange with no endpoint pick — a header response
+//     carrying no mutation plus the body echo — so the proxy continues the request; the
+//     EPP's decision becomes best-effort and it never fails the request stream (in-flight
+//     evictions close the stream gracefully instead of sending 429).
+//
+// fail-open exists for deployments whose ext_proc filter runs inline on a request stream it
+// must not be able to kill — e.g. an EPP serving a request-mirror (shadow) pool: in
+// FULL_DUPLEX_STREAMED mode the proxy has already handed the request body to the EPP, so an
+// ImmediateResponse or stream error tears down the PRIMARY request, not just the shadow copy
+// (which, lacking a destination header, is simply dropped).
+const EnvRoutingFailureMode = "EPP_ROUTING_FAILURE_MODE"
+
+// RoutingFailureModeFailOpen is the EnvRoutingFailureMode value enabling fail-open; any
+// other value (including unset) is fail-closed.
+const RoutingFailureModeFailOpen = "fail-open"
+
 func NewStreamingServer(datastore Datastore, director Director, parserRegistry *ParserRegistry, maxPoolBufferSize int) *StreamingServer {
 	return &StreamingServer{
 		director:          director,
 		datastore:         datastore,
 		parserRegistry:    parserRegistry,
 		maxPoolBufferSize: maxPoolBufferSize,
+		routingFailOpen:   os.Getenv(EnvRoutingFailureMode) == RoutingFailureModeFailOpen,
 		bufferPool: sync.Pool{
 			New: func() any {
 				return new(bytes.Buffer)
 			},
 		},
 	}
+}
+
+// SetRoutingFailureMode overrides the EPP_ROUTING_FAILURE_MODE designation (tests).
+func (s *StreamingServer) SetRoutingFailureMode(mode string) {
+	s.routingFailOpen = mode == RoutingFailureModeFailOpen
+}
+
+// isRoutingFailure reports whether err is a failure to place the request on an endpoint —
+// no candidate pods (ServiceUnavailable) or flow-control rejection/eviction
+// (ResourceExhausted) — as opposed to a request error the client must see.
+func isRoutingFailure(err error) bool {
+	switch errcommon.CanonicalCode(err) {
+	case errcommon.ServiceUnavailable, errcommon.ResourceExhausted:
+		return true
+	}
+	return false
+}
+
+// sendFailOpenContinue completes the ext_proc exchange with no endpoint pick: a header
+// response carrying no mutation, followed by the duplex body echo when a body was received.
+// The proxy continues the request as if the filter were a no-op; anything that depends on
+// the (absent) endpoint header — e.g. a request-mirror clone resolving its cluster from it —
+// is dropped.
+func sendFailOpenContinue(srv extProcPb.ExternalProcessor_ProcessServer, rawBody []byte) error {
+	headerResp := &extProcPb.ProcessingResponse{
+		Response: &extProcPb.ProcessingResponse_RequestHeaders{
+			RequestHeaders: &extProcPb.HeadersResponse{},
+		},
+	}
+	if err := srv.Send(headerResp); err != nil {
+		return err
+	}
+	if len(rawBody) > 0 {
+		for _, resp := range envoy.GenerateRequestBodyResponses(rawBody) {
+			if err := srv.Send(resp); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // SetEvictChannelLookup sets the eviction channel lookup for eviction support.
@@ -102,6 +164,9 @@ type StreamingServer struct {
 	evictionLookup    EvictChannelLookup // optional, set for eviction support
 	bufferPool        sync.Pool
 	maxPoolBufferSize int
+	// routingFailOpen: routing failures complete with no endpoint pick instead of rejecting
+	// the request; the EPP never fails the request stream (see EnvRoutingFailureMode).
+	routingFailOpen bool
 }
 
 // RequestContext stores context information during the life time of an HTTP request.
@@ -358,6 +423,14 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				evictCh = nil // prevent closed channel from firing repeatedly
 				continue
 			}
+			// fail-open: an in-flight eviction must not send an ImmediateResponse — it
+			// would reset the request stream this filter is inline on. Close the
+			// ext_proc stream gracefully instead; the request proceeds with whatever
+			// pick was already communicated.
+			if s.routingFailOpen {
+				logger.Info("Routing fail-open: ignoring flow-control eviction", "requestID", evictionRequestID)
+				return nil
+			}
 			// Eviction triggered — transition to evicted state and let the state machine send the response.
 			logger.Info("Request evicted by flow control", "requestID", evictionRequestID)
 			reqCtx.RequestState = RequestEvicted
@@ -517,6 +590,18 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				logger.V(logutil.DEBUG).Error(err, "Failed to process request", "request", req)
 			} else {
 				logger.Error(err, "Failed to process request")
+			}
+			// fail-open: complete the exchange with no endpoint pick instead of an
+			// ImmediateResponse, which would fail the request stream this filter is
+			// inline on (see EnvRoutingFailureMode). Only routing failures qualify —
+			// request errors (4xx) still reject.
+			if s.routingFailOpen && isRoutingFailure(err) {
+				logger.Info("Routing fail-open: continuing without endpoint pick", "cause", err.Error())
+				if sendErr := sendFailOpenContinue(srv, reqCtx.Request.RawBody); sendErr != nil {
+					logger.Error(sendErr, "Send failed")
+					return status.Errorf(codes.Unknown, "failed to send response back to Envoy: %v", sendErr)
+				}
+				return nil
 			}
 			resp, err := errcommon.BuildErrResponse(err)
 			if err != nil {
