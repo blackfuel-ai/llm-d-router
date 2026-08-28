@@ -41,6 +41,9 @@ const (
 	embeddingsAPI      = "embeddings"
 	// imagesGenerationsAPI is the OpenAI-compatible image generation endpoint/
 	imagesGenerationsAPI = "images/generations"
+	// tokenize is vLLM's tokenizer endpoint, served at the root rather than under
+	// the OpenAI prefix. The ai-gateway rewrites Anthropic count_tokens onto it.
+	tokenizeAPI = "tokenize"
 
 	streamingRespPrefix = "data: "
 	streamingEndMsg     = "data: [DONE]"
@@ -98,6 +101,7 @@ func (p *OpenAIParser) Claims() fwkrh.Claims {
 			chatCompletionsAPI + "/render",
 			completionsAPI + "/render",
 			imagesGenerationsAPI,
+			tokenizeAPI,
 		},
 		Protocols: []v1.AppProtocol{v1.AppProtocolH2C, v1.AppProtocolHTTP},
 	}
@@ -114,6 +118,20 @@ func (p *OpenAIParser) WithName(name string) *OpenAIParser {
 
 // ParseRequest parses the request body and headers and returns a map representation.
 func (p *OpenAIParser) ParseRequest(ctx context.Context, body []byte, headers map[string]string) (*fwkrh.ParseResult, error) {
+	// /tokenize returns only a token count and carries no usage to meter, so it gains
+	// nothing from structured parsing or response interception; forward the body
+	// unchanged, mirroring the anthropic parser's count_tokens branch. The "/" anchor
+	// keeps /detokenize — which also ends in "tokenize" — out of this branch.
+	//
+	// RawPayload is deliberate: it is not a MarshalablePayload, so the director skips
+	// the model rewrite instead of failing an unparsed body on an empty target model.
+	if strings.HasSuffix(request.GetRequestPath(headers), "/"+tokenizeAPI) {
+		return &fwkrh.ParseResult{
+			Body:                   &fwkrh.InferenceRequestBody{Payload: fwkrh.RawPayload(body)},
+			SkipResponseProcessing: true,
+		}, nil
+	}
+
 	bodyMap := make(map[string]any)
 	if err := json.Unmarshal(body, &bodyMap); err != nil {
 		return nil, fmt.Errorf("error unmarshaling request bodyMap: %w", err)
