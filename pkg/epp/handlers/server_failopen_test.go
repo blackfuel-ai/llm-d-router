@@ -98,7 +98,7 @@ func TestSendFailOpenContinue_WithBody(t *testing.T) {
 	assert.Nil(t, headerResp.GetResponse().GetHeaderMutation(), "must not set any header (no endpoint pick)")
 	assert.Nil(t, srv.sentResponses[0].DynamicMetadata, "must not attach endpoint metadata")
 
-	var echoed []byte
+	echoed := make([]byte, 0, len(body))
 	for i, resp := range srv.sentResponses[1:] {
 		bodyResp := resp.GetRequestBody()
 		require.NotNil(t, bodyResp, "response %d must be a body response", i+1)
