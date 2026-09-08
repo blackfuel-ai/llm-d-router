@@ -329,9 +329,10 @@ plugins:
     path: /metrics
     scheme: http
 - type: core-metrics-extractor
+- type: vllm-latency-window-extractor
 - type: predicted-latency-producer
   parameters:
-    streamingMode: true
+    latencyWindowPluginRef: vllm-latency-window-extractor
 - type: prefix-cache-affinity-filter
   name: strict-affinity-filter
   parameters:
@@ -353,6 +354,12 @@ schedulingProfiles:
   - pluginRef: loose-affinity-filter
   - pluginRef: latency-scorer
   - pluginRef: weighted-random-picker
+dataLayer:
+  sources:
+  - pluginRef: metrics-data-source
+    extractors:
+    - pluginRef: core-metrics-extractor
+    - pluginRef: vllm-latency-window-extractor
 `,
 		expectedPlugins: []configapi.PluginSpec{
 			{Name: "queue-scorer", Type: "queue-scorer"},
@@ -364,6 +371,7 @@ schedulingProfiles:
 			{Name: "token-producer", Type: "token-producer"},
 			{Name: "metrics-data-source", Type: "metrics-data-source"},
 			{Name: "core-metrics-extractor", Type: "core-metrics-extractor"},
+			{Name: "vllm-latency-window-extractor", Type: "vllm-latency-window-extractor"},
 			{Name: "predicted-latency-producer", Type: "predicted-latency-producer"},
 			{Name: "strict-affinity-filter", Type: "prefix-cache-affinity-filter"},
 			{Name: "loose-affinity-filter", Type: "prefix-cache-affinity-filter"},

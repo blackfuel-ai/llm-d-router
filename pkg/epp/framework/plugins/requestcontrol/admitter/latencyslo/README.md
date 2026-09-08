@@ -26,8 +26,8 @@ If none are met, the request is rejected.
 ## Config
 
 None. The plugin reads prediction validity directly from `LatencyPredictionInfo` endpoint
-attributes set by the `predicted-latency-producer` plugin. No `StreamingMode` config needed
-because the predictor already neutralizes TPOT for non-streaming mode and prefill endpoints.
+attributes set by the `predicted-latency-producer` plugin, which already neutralizes TPOT
+for prefill endpoints.
 
 ## Dependencies
 

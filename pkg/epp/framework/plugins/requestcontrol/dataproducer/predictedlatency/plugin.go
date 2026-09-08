@@ -41,6 +41,7 @@ import (
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	attrlatency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latency"
+	attrwindow "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latencywindow"
 	attrmm "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/multimodal"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	latencyproducerconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/constants"
@@ -59,12 +60,35 @@ const (
 
 	// ExperimentalDefaultPrefillProfile is the default profile name for prefill endpoints in disaggregated serving.
 	ExperimentalDefaultPrefillProfile = "prefill"
+
+	// windowStalenessThreshold is the maximum age of an endpoint's latency
+	// window for it to label a completed request. The extractors republish
+	// on every scrape that closes a window, so an older window means the
+	// endpoint stopped serving or stopped being scraped and its distribution
+	// no longer describes the request.
+	windowStalenessThreshold = 10 * time.Second
 )
+
+// windowSource is the live view of a vllm-latency-window-extractor
+// instance: the most recently published TTFT and TPOT windows per endpoint.
+// The producer reads them at request completion, when the scheduling-time
+// endpoint snapshot is already behind.
+type windowSource interface {
+	// TTFTDataKey and TPOTDataKey are the attribute keys the instance
+	// publishes under.
+	TTFTDataKey() plugin.DataKey
+	TPOTDataKey() plugin.DataKey
+	// LatestTTFT and LatestTPOT return the endpoint's latest window, or
+	// false when none has been published for it.
+	LatestTTFT(endpointID string) (*attrwindow.WindowedLatency, bool)
+	LatestTPOT(endpointID string) (*attrwindow.WindowedLatency, bool)
+}
 
 // PredictedLatency is the latency data provider plugin. It handles:
 //   - Produce: bulk predictions via the latency predictor sidecar
 //   - PreRequest: dispatch-time bookkeeping (token counters, request queues)
-//   - ResponseHeader/ResponseBody: training data collection (TTFT/TPOT)
+//   - ResponseBody: training data collection at request completion, labelled
+//     from the target endpoint's TTFT and TPOT latency windows
 //   - Produces/Consumes: endpoint attribute declarations
 //
 // Scoring, picking, and admission are handled by separate sub-plugins:
@@ -79,6 +103,23 @@ type PredictedLatency struct {
 	inFlightLoadDataKey          plugin.DataKey
 	encoderCacheDataKey          plugin.DataKey
 	latencyPredictionInfoDataKey plugin.DataKey
+	// latencyWindows is the extractor instance whose TTFT and TPOT windows
+	// label the training samples.
+	latencyWindows windowSource
+}
+
+// usableWindow reads the endpoint's latest window through lookup, rejecting
+// windows that never published, are empty, or are older than
+// windowStalenessThreshold.
+func usableWindow(lookup func(string) (*attrwindow.WindowedLatency, bool), endpointID string, now time.Time) (*attrwindow.WindowedLatency, bool) {
+	window, ok := lookup(endpointID)
+	if !ok || window.WindowSamples == 0 {
+		return nil, false
+	}
+	if now.Sub(window.UpdatedAt) > windowStalenessThreshold {
+		return nil, false
+	}
+	return window, true
 }
 
 // endpointInFlightLoad reads the InFlightLoad attribute published by the
@@ -234,8 +275,12 @@ type Config struct {
 	MaxDecodeTokenSamplesForPrediction int           `json:"maxDecodeTokenSamplesForPrediction,omitempty"`
 	SLOBufferFactor                    float64       `json:"sloBufferFactor,omitempty"`
 	ContextTTL                         time.Duration `json:"contextTTL,omitempty"`
-	StreamingMode                      bool          `json:"streamingMode,omitempty"`
 	EndpointRoleLabel                  string        `json:"endpointRoleLabel,omitempty"`
+	// LatencyWindowPluginRef names the vllm-latency-window-extractor instance
+	// windowing the endpoint's time-to-first-token and inter-token-latency
+	// histograms; its latest windows label the TTFT and TPOT training
+	// samples of every completed request. Required.
+	LatencyWindowPluginRef string `json:"latencyWindowPluginRef" pluginRef:""`
 	// PredictInProduce controls whether bulk predictions are generated during
 	// Produce. Set to false to disable predictions (training-only mode).
 	// When false, the predictor still collects training data but does not call the
@@ -263,17 +308,27 @@ var DefaultConfig = Config{
 	MaxDecodeTokenSamplesForPrediction: 0,
 	SLOBufferFactor:                    1,
 	ContextTTL:                         5 * time.Minute,
-	StreamingMode:                      false,
 	PredictInProduce:                   true,
 }
 
-func PredictedLatencyFactory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
+// ConfigParser decodes the producer parameters so the plugin loader can order
+// this plugin after the extractor instances its pluginRef fields name.
+func ConfigParser(rawParameters *json.Decoder, _ plugin.Handle) (any, error) {
 	parameters := DefaultConfig
 	if rawParameters != nil {
 		if err := rawParameters.Decode(&parameters); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal config for PredictedLatency: %w", err)
 		}
 	}
+	return parameters, nil
+}
+
+func PredictedLatencyFactory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
+	parsed, err := ConfigParser(rawParameters, handle)
+	if err != nil {
+		return nil, err
+	}
+	parameters := parsed.(Config)
 
 	if err := parameters.validate(); err != nil {
 		return nil, fmt.Errorf("invalid PredictedLatency config: %w", err)
@@ -281,6 +336,10 @@ func PredictedLatencyFactory(name string, rawParameters *json.Decoder, handle pl
 
 	if handle == nil {
 		return nil, errors.New("plugin handle is required")
+	}
+	latencyWindows, err := resolveWindowSource(handle, parameters.LatencyWindowPluginRef)
+	if err != nil {
+		return nil, fmt.Errorf("invalid PredictedLatency config: latencyWindowPluginRef: %w", err)
 	}
 	if parameters.SamplingMean != DefaultConfig.SamplingMean || parameters.MaxDecodeTokenSamplesForPrediction != DefaultConfig.MaxDecodeTokenSamplesForPrediction {
 		log.FromContext(handle.Context()).Info("Deprecated: samplingMean and maxDecodeTokenSamplesForPrediction are ignored; mid-stream TPOT predictions were removed")
@@ -294,7 +353,18 @@ func PredictedLatencyFactory(name string, rawParameters *json.Decoder, handle pl
 		return nil, fmt.Errorf("failed to start latency predictor: %w", err)
 	}
 
-	return NewPredictedLatency(name, parameters, predictor), nil
+	return NewPredictedLatency(name, parameters, predictor, latencyWindows), nil
+}
+
+// resolveWindowSource returns the already-instantiated extractor named by
+// pluginRef. The loader instantiates pluginRef dependencies first, so a nil
+// lookup means the pool configuration does not declare the instance.
+func resolveWindowSource(handle plugin.Handle, pluginRef string) (windowSource, error) {
+	source, ok := handle.Plugin(pluginRef).(windowSource)
+	if !ok {
+		return nil, fmt.Errorf("plugin %q is not a %s instance", pluginRef, attrwindow.ExtractorType)
+	}
+	return source, nil
 }
 
 func (c *Config) validate() error {
@@ -303,6 +373,9 @@ func (c *Config) validate() error {
 	if c.SLOBufferFactor <= 0 {
 		errs = append(errs, fmt.Errorf("sloBufferFactor must be > 0, got %f", c.SLOBufferFactor))
 	}
+	if c.LatencyWindowPluginRef == "" {
+		errs = append(errs, errors.New("latencyWindowPluginRef is required"))
+	}
 
 	if len(errs) > 0 {
 		return errors.Join(errs...)
@@ -310,11 +383,12 @@ func (c *Config) validate() error {
 	return nil
 }
 
-func NewPredictedLatency(name string, config Config, predictor latencypredictor.PredictorInterface) *PredictedLatency {
+func NewPredictedLatency(name string, config Config, predictor latencypredictor.PredictorInterface, latencyWindows windowSource) *PredictedLatency {
 	predictedLatency := &PredictedLatency{
 		typedName:                    plugin.TypedName{Type: LatencyDataProviderPluginType, Name: name},
 		latencypredictor:             predictor,
 		config:                       config,
+		latencyWindows:               latencyWindows,
 		prefixMatchDataKey:           attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(config.PrefixMatchInfoProducerName),
 		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(config.InFlightLoadProducerName),
 		encoderCacheDataKey:          attrmm.EncoderCacheMatchInfoKey.WithNonEmptyProducerName(config.EncoderCacheMatchInfoProducerName),
@@ -368,20 +442,20 @@ func (pl *PredictedLatency) getOrMakePredictedLatencyContextForRequest(request *
 
 // predictedLatencyCtx holds per-request state for latency prediction and training.
 type predictedLatencyCtx struct {
-	schedulingRequest         fwksched.InferenceRequest
-	targetMetadata            *fwkdl.EndpointMetadata
-	prefillTargetMetadata     *fwkdl.EndpointMetadata
-	schedulingResult          *fwksched.SchedulingResult
-	lastSeenMetrics           map[string]*fwkdl.Metrics
-	lastTokenTimestamp        time.Time
-	requestReceivedTimestamp  time.Time
-	generatedTokenCount       int
-	incomingModelName         string
-	ttft                      float64
-	predictedTTFT             float64
-	avgTPOT                   float64
-	avgPredictedTPOT          float64
-	predictedTPOTObservations []float64
+	schedulingRequest        fwksched.InferenceRequest
+	targetMetadata           *fwkdl.EndpointMetadata
+	prefillTargetMetadata    *fwkdl.EndpointMetadata
+	schedulingResult         *fwksched.SchedulingResult
+	lastSeenMetrics          map[string]*fwkdl.Metrics
+	requestReceivedTimestamp time.Time
+	incomingModelName        string
+	// ttft and avgTPOT are the training labels of the completed request, in
+	// milliseconds, read from the target endpoint's latency windows at
+	// request completion; zero when the corresponding window was unavailable.
+	ttft             float64
+	predictedTTFT    float64
+	avgTPOT          float64
+	avgPredictedTPOT float64
 
 	inputTokenCount int
 

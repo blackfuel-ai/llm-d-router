@@ -37,7 +37,13 @@ data:
     - type: {{ $p }}
     {{- end }}
     {{- if .Values.router.latencyPredictor.enabled }}
+    # The producer labels its training samples from the endpoint's windowed
+    # vLLM TTFT and inter-token latency histograms; the extractor is attached
+    # to the metrics source in dataLayer below.
+    - type: vllm-latency-window-extractor
     - type: predicted-latency-producer
+      parameters:
+        latencyWindowPluginRef: vllm-latency-window-extractor
     # Two-gate prefix cache affinity: strict (0.99) runs before the SLO tier
     # filter to prefer near-exact cache matches across all endpoints; loose
     # (0.80) runs after the tier filter to prefer partial matches within the
@@ -85,6 +91,16 @@ data:
       {{- range $p := $parsers }}
       - pluginRef: {{ $p }}
       {{- end }}
+    {{- end }}
+    {{- if .Values.router.latencyPredictor.enabled }}
+    # An explicit metrics-data-source entry disables the default extractor
+    # injection, so core-metrics-extractor is listed alongside the window extractor.
+    dataLayer:
+      sources:
+      - pluginRef: metrics-data-source
+        extractors:
+        - pluginRef: core-metrics-extractor
+        - pluginRef: vllm-latency-window-extractor
     {{- end }}
   payload-agnostic.yaml: |
     # Request-format agnostic routing. Use this when the request format is

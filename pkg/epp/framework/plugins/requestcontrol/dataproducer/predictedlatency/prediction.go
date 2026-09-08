@@ -103,12 +103,11 @@ func (pl *PredictedLatency) generatePredictions(ctx context.Context, predictedLa
 		podMinTPOTSLO := pl.getEndpointMinTPOTSLO(endpoint)
 		predResult.TTFTValid, predResult.TPOTValid, predResult.IsValid, predResult.Headroom, predResult.TTFTHeadroom = pl.validatePrediction(prediction, predictedLatencyCtx, podMinTPOTSLO)
 
-		// Neutralize TPOT when it's not meaningful:
-		// - Non-streaming mode: TPOT is never trained (no per-token observations)
-		// - Disaggregated prefill: prefill pods don't generate tokens
-		// Setting TPOTValid=true and Headroom=0 prevents untrained TPOT
-		// predictions from polluting scoring, tier classification, or admission.
-		if !pl.config.StreamingMode || hasPrefillRole(pl.config.EndpointRoleLabel, endpoint) {
+		// Neutralize TPOT on disaggregated prefill endpoints: prefill pods
+		// don't generate tokens. Setting TPOTValid=true and Headroom=0 keeps
+		// an untrained TPOT prediction out of scoring, tier classification
+		// and admission.
+		if hasPrefillRole(pl.config.EndpointRoleLabel, endpoint) {
 			predResult.TPOTValid = true
 			predResult.Headroom = 0
 			predResult.IsValid = predResult.TTFTValid
@@ -155,22 +154,17 @@ func (pl *PredictedLatency) validatePrediction(
 	ttftOk = pred.TTFT < predictedLatencyCtx.ttftSLO
 	ttftHeadroom = predictedLatencyCtx.ttftSLO - pred.TTFT
 
-	tpotOk = true
-	headroom = 0.0
-
-	if pl.config.StreamingMode {
-		bufferedTPOT := predictedLatencyCtx.avgTPOTSLO * pl.config.SLOBufferFactor
-		// a podMinTPOTSLO of 0 means no either no requests, or no TPOT SLOs specified on running requests
-		if podMinTPOTSLO > 0 {
-			if podMinTPOTSLO < predictedLatencyCtx.avgTPOTSLO {
-				log.FromContext(context.Background()).V(logutil.DEBUG).Info("Endpoint min TPOT SLO is less than the req SLO, adjusting", "podMinTPOTSLO", podMinTPOTSLO, "bufferedTPOT", predictedLatencyCtx.avgTPOTSLO)
-			}
-			bufferedTPOT = min(bufferedTPOT, podMinTPOTSLO*pl.config.SLOBufferFactor)
+	bufferedTPOT := predictedLatencyCtx.avgTPOTSLO * pl.config.SLOBufferFactor
+	// a podMinTPOTSLO of 0 means either no requests, or no TPOT SLOs specified on running requests
+	if podMinTPOTSLO > 0 {
+		if podMinTPOTSLO < predictedLatencyCtx.avgTPOTSLO {
+			log.FromContext(context.Background()).V(logutil.DEBUG).Info("Endpoint min TPOT SLO is less than the req SLO, adjusting", "podMinTPOTSLO", podMinTPOTSLO, "bufferedTPOT", predictedLatencyCtx.avgTPOTSLO)
 		}
-
-		tpotOk = pred.TPOT < bufferedTPOT
-		headroom = bufferedTPOT - pred.TPOT
+		bufferedTPOT = min(bufferedTPOT, podMinTPOTSLO*pl.config.SLOBufferFactor)
 	}
+
+	tpotOk = pred.TPOT < bufferedTPOT
+	headroom = bufferedTPOT - pred.TPOT
 
 	isValid = ttftOk && tpotOk
 

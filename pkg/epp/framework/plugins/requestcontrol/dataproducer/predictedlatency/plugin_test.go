@@ -36,6 +36,8 @@ import (
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
+	attrwindow "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latencywindow"
+	extlatencywindow "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/extractor/latencywindow"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 	testutils "github.com/llm-d/llm-d-router/test/utils"
 )
@@ -47,6 +49,67 @@ type mockPredictor struct {
 	// capturedBulkStrictRequests records the requests passed to the most recent
 	// PredictBulkStrict call, so tests can assert what was sent to the predictor.
 	capturedBulkStrictRequests []latencypredictor.PredictionRequest
+	// capturedTrainingEntries accumulates every entry passed to
+	// AddTrainingDataBulk / AddTrainingData, so tests can assert on labels.
+	capturedTrainingEntries []latencypredictor.TrainingEntry
+}
+
+// testLatencyWindowRef is the name of the window extractor instance the
+// producer reads in tests.
+const testLatencyWindowRef = "latency-windows"
+
+// fakeWindowSource is an in-memory windowSource keyed by endpoint ID.
+type fakeWindowSource struct {
+	ttftKey fwkplugin.DataKey
+	tpotKey fwkplugin.DataKey
+	ttft    map[string]*attrwindow.WindowedLatency
+	tpot    map[string]*attrwindow.WindowedLatency
+}
+
+func newFakeWindowSource() *fakeWindowSource {
+	return &fakeWindowSource{
+		ttftKey: attrwindow.TTFTWindowDataKey.WithNonEmptyProducerName(testLatencyWindowRef),
+		tpotKey: attrwindow.TPOTWindowDataKey.WithNonEmptyProducerName(testLatencyWindowRef),
+		ttft:    map[string]*attrwindow.WindowedLatency{},
+		tpot:    map[string]*attrwindow.WindowedLatency{},
+	}
+}
+
+func (f *fakeWindowSource) TTFTDataKey() fwkplugin.DataKey { return f.ttftKey }
+func (f *fakeWindowSource) TPOTDataKey() fwkplugin.DataKey { return f.tpotKey }
+
+func (f *fakeWindowSource) LatestTTFT(endpointID string) (*attrwindow.WindowedLatency, bool) {
+	window, ok := f.ttft[endpointID]
+	return window, ok
+}
+
+func (f *fakeWindowSource) LatestTPOT(endpointID string) (*attrwindow.WindowedLatency, bool) {
+	window, ok := f.tpot[endpointID]
+	return window, ok
+}
+
+// freshWindow is a published, non-empty window of quantileMs.
+func freshWindow(quantileMs float64) *attrwindow.WindowedLatency {
+	return &attrwindow.WindowedLatency{QuantileMs: quantileMs, MeanMs: quantileMs, WindowSamples: 100, UpdatedAt: time.Now()}
+}
+
+// testConfig is DefaultConfig with the required window reference set.
+func testConfig() Config {
+	cfg := DefaultConfig
+	cfg.LatencyWindowPluginRef = testLatencyWindowRef
+	return cfg
+}
+
+// newTestPredictedLatency builds a producer over a fresh fake window source.
+func newTestPredictedLatency(name string, cfg Config, predictor latencypredictor.PredictorInterface) *PredictedLatency {
+	return NewPredictedLatency(name, cfg, predictor, newFakeWindowSource())
+}
+
+// addTestWindowExtractor registers a real extractor instance under the test
+// window name on the handle, as the plugin loader does before instantiating
+// the producer.
+func addTestWindowExtractor(handle fwkplugin.Handle) {
+	handle.AddPlugin(testLatencyWindowRef, extlatencywindow.NewExtractor(testLatencyWindowRef, extlatencywindow.DefaultTTFTMetricName, extlatencywindow.DefaultTPOTMetricName, 0.5, 50))
 }
 
 func (m *mockPredictor) Predict(ctx context.Context, request latencypredictor.PredictionRequest) (*latencypredictor.PredictionResponse, error) {
@@ -94,10 +157,12 @@ func (m *mockPredictor) PredictBulkStrict(ctx context.Context, requests []latenc
 }
 
 func (m *mockPredictor) AddTrainingDataBulk(data []latencypredictor.TrainingEntry) error {
+	m.capturedTrainingEntries = append(m.capturedTrainingEntries, data...)
 	return nil
 }
 
 func (m *mockPredictor) AddTrainingData(data latencypredictor.TrainingEntry) error {
+	m.capturedTrainingEntries = append(m.capturedTrainingEntries, data)
 	return nil
 }
 
@@ -237,7 +302,7 @@ func TestParseSLOHeaders(t *testing.T) {
 func TestPredictedLatency_TypedName(t *testing.T) {
 	predictor := &mockPredictor{}
 	cfg := DefaultConfig
-	router := NewPredictedLatency(LatencyDataProviderPluginType, cfg, predictor)
+	router := newTestPredictedLatency(LatencyDataProviderPluginType, cfg, predictor)
 
 	tn := router.TypedName()
 	assert.Equal(t, "predicted-latency-producer", tn.Type, "Type should be latency-predictor")
@@ -248,7 +313,7 @@ func TestPredictedLatency_WithName(t *testing.T) {
 	predictor := &mockPredictor{}
 	cfg := DefaultConfig
 	customName := "custom-router"
-	router := NewPredictedLatency(customName, cfg, predictor)
+	router := newTestPredictedLatency(customName, cfg, predictor)
 
 	tn := router.TypedName()
 	assert.Equal(t, "predicted-latency-producer", tn.Type, "Type should remain latency-predictor")
@@ -300,7 +365,7 @@ func TestPredictedLatency_GetPodRunningRequestCount(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			predictor := &mockPredictor{}
 			cfg := DefaultConfig
-			router := NewPredictedLatency(LatencyDataProviderPluginType, cfg, predictor)
+			router := newTestPredictedLatency(LatencyDataProviderPluginType, cfg, predictor)
 			pod := createTestEndpoint("test-pod", 0.5, 2, 1)
 
 			tt.setupRequests(router, pod)
@@ -356,7 +421,7 @@ func TestPredictedLatency_GetPodMinTPOTSLO(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			predictor := &mockPredictor{}
 			cfg := DefaultConfig
-			router := NewPredictedLatency(LatencyDataProviderPluginType, cfg, predictor)
+			router := newTestPredictedLatency(LatencyDataProviderPluginType, cfg, predictor)
 			pod := createTestEndpoint("test-pod", 0.5, 2, 1)
 
 			tt.setupRequests(router, pod)
@@ -380,26 +445,51 @@ func TestPredictedLatencyFactory(t *testing.T) {
 			jsonParams: `{
 				"samplingMean": 150.0,
 				"maxDecodeTokenSamplesForPrediction": 30,
-				"sloBufferFactor": 1.2
+				"sloBufferFactor": 1.2,
+				"latencyWindowPluginRef": "latency-windows"
 			}`,
 			expectErr: false,
 		},
 		{
 			name:       "valid config with minimal override (uses defaults)",
 			pluginName: "minimal",
-			jsonParams: `{}`,
+			jsonParams: `{"latencyWindowPluginRef": "latency-windows"}`,
 			expectErr:  false,
 		},
 		{
 			name:       "deprecated sampling params are accepted and ignored",
 			pluginName: "deprecated-sampling-params",
-			jsonParams: `{"samplingMean": -1.0, "maxDecodeTokenSamplesForPrediction": -1}`,
+			jsonParams: `{"samplingMean": -1.0, "maxDecodeTokenSamplesForPrediction": -1, "latencyWindowPluginRef": "latency-windows"}`,
 			expectErr:  false,
 		},
 		{
 			name:       "invalid sloBufferFactor <= 0",
 			pluginName: "bad-buffer",
-			jsonParams: `{"sloBufferFactor": 0}`,
+			jsonParams: `{"sloBufferFactor": 0, "latencyWindowPluginRef": "latency-windows"}`,
+			expectErr:  true,
+		},
+		{
+			name:       "missing window reference",
+			pluginName: "no-windows",
+			jsonParams: `{}`,
+			expectErr:  true,
+		},
+		{
+			name:       "window reference names a plugin that is not a window extractor",
+			pluginName: "wrong-type",
+			jsonParams: `{"latencyWindowPluginRef": "not-an-extractor"}`,
+			expectErr:  true,
+		},
+		{
+			name:       "window reference names an unknown plugin",
+			pluginName: "unknown-ref",
+			jsonParams: `{"latencyWindowPluginRef": "nowhere"}`,
+			expectErr:  true,
+		},
+		{
+			name:       "streamingMode is not a parameter",
+			pluginName: "streaming-mode",
+			jsonParams: `{"streamingMode": true, "latencyWindowPluginRef": "latency-windows"}`,
 			expectErr:  true,
 		},
 	}
@@ -407,6 +497,8 @@ func TestPredictedLatencyFactory(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			handle := testutils.NewTestHandle(context.Background())
+			addTestWindowExtractor(handle)
+			handle.AddPlugin("not-an-extractor", &mockPlugin{})
 			rawParams := json.RawMessage(tt.jsonParams)
 			plugin, err := PredictedLatencyFactory(tt.pluginName, fwkplugin.StrictDecoder(rawParams), handle)
 
@@ -419,6 +511,13 @@ func TestPredictedLatencyFactory(t *testing.T) {
 			}
 		})
 	}
+}
+
+// mockPlugin is a plugin of no particular kind, for negative type checks.
+type mockPlugin struct{}
+
+func (m *mockPlugin) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Type: "mock", Name: "not-an-extractor"}
 }
 
 func TestPredictedLatencyFactoryInvalidJSON(t *testing.T) {
@@ -455,7 +554,7 @@ func TestPredictedLatencyFactoryInvalidJSON(t *testing.T) {
 func TestSloContextStoreEviction(t *testing.T) {
 	config := DefaultConfig
 	config.ContextTTL = 100 * time.Millisecond
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, config, nil)
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, config, nil)
 
 	requestID := "test-req-id"
 	endpointName := types.NamespacedName{Name: "test-model", Namespace: "default"}
