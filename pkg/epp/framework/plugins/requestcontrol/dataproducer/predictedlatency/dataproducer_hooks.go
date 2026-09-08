@@ -28,6 +28,7 @@ import (
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	attrlatency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latency"
+	attrwindow "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latencywindow"
 	attrmm "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/multimodal"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	tokenproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
@@ -172,6 +173,10 @@ func (pl *PredictedLatency) Consumes() plugin.DataDependencies {
 		pl.prefixMatchDataKey:                attrprefix.PrefixCacheMatchInfo{},
 		pl.inFlightLoadDataKey:               attrconcurrency.InFlightLoad{},
 		tokenproducer.TokenizedPromptDataKey: fwksched.TokenizedPrompt{},
+		// The two latency windows label every training sample; declaring
+		// them binds the producer to the extractor instances it reads.
+		pl.latencyWindows.TTFTDataKey(): attrwindow.WindowedLatency{},
+		pl.latencyWindows.TPOTDataKey(): attrwindow.WindowedLatency{},
 	}
 	// Required (not Optional) because only Required dependencies create DAG
 	// ordering edges; the encoder-cache producer must run before this plugin.

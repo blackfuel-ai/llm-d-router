@@ -284,14 +284,3 @@ func bulkPredictWithMetrics(
 
 	return results, nil
 }
-
-// calculateRunningAverage calculates the running average efficiently.
-func calculateRunningAverage(currentAvg float64, newValue float64, count int) float64 {
-	if count == 0 {
-		return 0
-	}
-	if count == 1 {
-		return newValue
-	}
-	return currentAvg + (newValue-currentAvg)/float64(count)
-}

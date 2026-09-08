@@ -33,6 +33,8 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	attrwindow "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latencywindow"
+	latencypredictor "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/latencypredictorclient"
 )
 
 const (
@@ -59,8 +61,7 @@ func createTestSchedulingResult(metadata *fwkdl.EndpointMetadata) *fwksched.Sche
 }
 
 func createTestRouter() *PredictedLatency {
-	cfg := DefaultConfig
-	cfg.StreamingMode = true
+	cfg := testConfig()
 	return &PredictedLatency{
 		sloContextStore: ttlcache.New(
 			ttlcache.WithTTL[string, *predictedLatencyCtx](cfg.ContextTTL),
@@ -68,7 +69,223 @@ func createTestRouter() *PredictedLatency {
 		// runningRequestLists is a sync.Map and needs no initialization
 		latencypredictor: nil,
 		config:           cfg,
+		latencyWindows:   newFakeWindowSource(),
 	}
+}
+
+// testWindows returns the router's fake window source for seeding.
+func testWindows(router *PredictedLatency) *fakeWindowSource {
+	return router.latencyWindows.(*fakeWindowSource)
+}
+
+// completedRequestFixture wires a request whose PreRequest bookkeeping is
+// already done: context stored, target set, metrics seen, queued on the
+// endpoint. Returns the request and the endpoint.
+func completedRequestFixture(router *PredictedLatency, reqID string) (*fwksched.InferenceRequest, fwksched.Endpoint) {
+	endpoint := createTestEndpoint("test-pod", 1, 1, 1)
+	request := createTestInferenceRequest(reqID, 100, 50)
+	schedulingResult := createTestSchedulingResult(endpoint.GetMetadata())
+
+	predictedLatencyCtx := newPredictedLatencyContext(request)
+	predictedLatencyCtx.targetMetadata = endpoint.GetMetadata()
+	predictedLatencyCtx.requestReceivedTimestamp = time.Now().Add(-200 * time.Millisecond)
+	predictedLatencyCtx.schedulingResult = schedulingResult
+	predictedLatencyCtx.schedulingRequest = *request
+	predictedLatencyCtx.ttftSLO = 100
+	predictedLatencyCtx.avgTPOTSLO = 50
+	predictedLatencyCtx.incomingModelName = testModelName
+	predictedLatencyCtx.prefillTokensAtDispatch = 300
+	predictedLatencyCtx.requestsAtDispatch = 7
+	predictedLatencyCtx.predictionsForScheduling["test-pod"] = endpointPredictionResult{TTFT: 85, TPOT: 32}
+	predictedLatencyCtx.predictedTTFT = 85
+	predictedLatencyCtx.lastSeenMetrics["default"] = &fwkdl.Metrics{
+		KVCacheUsagePercent: 0.5,
+		WaitingQueueSize:    1,
+		RunningRequestsSize: 1,
+	}
+	router.setPredictedLatencyContextForRequest(request, predictedLatencyCtx)
+
+	queue := newRequestPriorityQueue()
+	queue.Add(request.Headers[reqcommon.RequestIDHeaderKey], 50.0)
+	router.runningRequestLists.Store(endpoint.GetMetadata().ID, queue)
+	return request, endpoint
+}
+
+// trainingLabels splits the captured entries into TTFT-labelled and
+// TPOT-labelled ones.
+func trainingLabels(entries []latencypredictor.TrainingEntry) (ttft, tpot []latencypredictor.TrainingEntry) {
+	for _, entry := range entries {
+		if entry.ActualTTFT > 0 {
+			ttft = append(ttft, entry)
+		}
+		if entry.ActualTPOT > 0 {
+			tpot = append(tpot, entry)
+		}
+	}
+	return ttft, tpot
+}
+
+func TestResponseBody_ChunkBeforeEndOfStreamSendsNothing(t *testing.T) {
+	router := createTestRouter()
+	predictor := new(mockPredictor)
+	router.latencypredictor = predictor
+	windows := testWindows(router)
+	windows.ttft["default/test-pod"] = freshWindow(120)
+	windows.tpot["default/test-pod"] = freshWindow(25)
+	request, endpoint := completedRequestFixture(router, "chunk")
+
+	router.ResponseBody(context.Background(), request, &requestcontrol.Response{}, endpoint.GetMetadata())
+
+	assert.Empty(t, predictor.capturedTrainingEntries, "a non-final chunk must not train")
+	retrieved, err := router.getPredictedLatencyContextForRequest(request)
+	require.NoError(t, err)
+	assert.Zero(t, retrieved.ttft)
+	assert.Zero(t, retrieved.avgTPOT)
+}
+
+// TestResponseBody_LabelsFromWindowsRegardlessOfChunking is the core
+// guarantee: a response streamed in several chunks and a response that
+// arrives whole produce identical training samples, both labelled from the
+// endpoint's TTFT and TPOT windows.
+func TestResponseBody_LabelsFromWindowsRegardlessOfChunking(t *testing.T) {
+	run := func(t *testing.T, chunksBeforeEOS int) []latencypredictor.TrainingEntry {
+		router := createTestRouter()
+		predictor := new(mockPredictor)
+		router.latencypredictor = predictor
+		windows := testWindows(router)
+		windows.ttft["default/test-pod"] = freshWindow(120)
+		windows.tpot["default/test-pod"] = freshWindow(25)
+		request, endpoint := completedRequestFixture(router, "req")
+		ctx := context.Background()
+
+		for range chunksBeforeEOS {
+			router.ResponseBody(ctx, request, &requestcontrol.Response{}, endpoint.GetMetadata())
+		}
+		router.ResponseBody(ctx, request, &requestcontrol.Response{EndOfStream: true}, endpoint.GetMetadata())
+
+		_, err := router.getPredictedLatencyContextForRequest(request)
+		assert.Error(t, err, "context is deleted at end of stream")
+		return predictor.capturedTrainingEntries
+	}
+
+	streamed := run(t, 5)
+	whole := run(t, 0)
+	require.Len(t, streamed, 2)
+	require.Len(t, whole, 2)
+	// Timestamps differ between runs; compare everything else.
+	for i := range streamed {
+		streamed[i].Timestamp = time.Time{}
+		whole[i].Timestamp = time.Time{}
+	}
+	assert.Equal(t, streamed, whole, "chunking must not change the samples")
+
+	ttftEntries, tpotEntries := trainingLabels(whole)
+	require.Len(t, ttftEntries, 1)
+	require.Len(t, tpotEntries, 1)
+	assert.Equal(t, 120.0, ttftEntries[0].ActualTTFT)
+	assert.Zero(t, ttftEntries[0].ActualTPOT)
+	assert.Equal(t, 25.0, tpotEntries[0].ActualTPOT)
+	assert.Zero(t, tpotEntries[0].ActualTTFT)
+	// Dispatch-time features ride along on both samples.
+	for _, entry := range whole {
+		assert.Equal(t, int64(300), entry.PrefillTokensInFlight)
+		assert.Equal(t, 7, entry.NumRequestRunning)
+		assert.Equal(t, 2, entry.InputTokenLength)
+		// Metrics are refreshed from the scheduled endpoint on every chunk.
+		assert.Equal(t, float64(kvUsage), entry.KVCachePercentage)
+	}
+}
+
+func TestResponseBody_MissingWindowSkipsThatLabelOnly(t *testing.T) {
+	t.Run("no TTFT window", func(t *testing.T) {
+		router := createTestRouter()
+		predictor := new(mockPredictor)
+		router.latencypredictor = predictor
+		testWindows(router).tpot["default/test-pod"] = freshWindow(25)
+		request, endpoint := completedRequestFixture(router, "no-ttft")
+
+		router.ResponseBody(context.Background(), request, &requestcontrol.Response{EndOfStream: true}, endpoint.GetMetadata())
+
+		ttftEntries, tpotEntries := trainingLabels(predictor.capturedTrainingEntries)
+		assert.Empty(t, ttftEntries)
+		require.Len(t, tpotEntries, 1)
+		assert.Equal(t, 25.0, tpotEntries[0].ActualTPOT)
+	})
+	t.Run("no TPOT window", func(t *testing.T) {
+		router := createTestRouter()
+		predictor := new(mockPredictor)
+		router.latencypredictor = predictor
+		testWindows(router).ttft["default/test-pod"] = freshWindow(120)
+		request, endpoint := completedRequestFixture(router, "no-tpot")
+
+		router.ResponseBody(context.Background(), request, &requestcontrol.Response{EndOfStream: true}, endpoint.GetMetadata())
+
+		ttftEntries, tpotEntries := trainingLabels(predictor.capturedTrainingEntries)
+		require.Len(t, ttftEntries, 1)
+		assert.Equal(t, 120.0, ttftEntries[0].ActualTTFT)
+		assert.Empty(t, tpotEntries)
+	})
+	t.Run("empty and stale windows are unusable", func(t *testing.T) {
+		router := createTestRouter()
+		predictor := new(mockPredictor)
+		router.latencypredictor = predictor
+		windows := testWindows(router)
+		windows.ttft["default/test-pod"] = &attrwindow.WindowedLatency{QuantileMs: 120, WindowSamples: 0, UpdatedAt: time.Now()}
+		windows.tpot["default/test-pod"] = &attrwindow.WindowedLatency{QuantileMs: 25, WindowSamples: 100, UpdatedAt: time.Now().Add(-windowStalenessThreshold - time.Second)}
+		request, endpoint := completedRequestFixture(router, "stale")
+
+		router.ResponseBody(context.Background(), request, &requestcontrol.Response{EndOfStream: true}, endpoint.GetMetadata())
+
+		assert.Empty(t, predictor.capturedTrainingEntries)
+		_, err := router.getPredictedLatencyContextForRequest(request)
+		assert.Error(t, err, "cleanup still happens")
+	})
+}
+
+func TestResponseBody_PredictedTPOTComesFromSchedulingPrediction(t *testing.T) {
+	router := createTestRouter()
+	predictor := new(mockPredictor)
+	router.latencypredictor = predictor
+	windows := testWindows(router)
+	windows.ttft["default/test-pod"] = freshWindow(120)
+	windows.tpot["default/test-pod"] = freshWindow(25)
+	request, endpoint := completedRequestFixture(router, "predicted")
+	stored, _ := router.getPredictedLatencyContextForRequest(request)
+
+	router.ResponseBody(context.Background(), request, &requestcontrol.Response{EndOfStream: true}, endpoint.GetMetadata())
+
+	assert.Equal(t, 25.0, stored.avgTPOT)
+	assert.Equal(t, 32.0, stored.avgPredictedTPOT, "predicted TPOT is the scheduling-time prediction for the target")
+	assert.Equal(t, 120.0, stored.ttft)
+	assert.Equal(t, 85.0, stored.predictedTTFT)
+}
+
+func TestResponseBody_DisaggregatedTTFTFromPrefillEndpointWindow(t *testing.T) {
+	router := createTestRouter()
+	predictor := new(mockPredictor)
+	router.latencypredictor = predictor
+	windows := testWindows(router)
+	windows.ttft["default/prefill-pod"] = freshWindow(300)
+	windows.ttft["default/test-pod"] = freshWindow(120)
+	windows.tpot["default/test-pod"] = freshWindow(25)
+	request, endpoint := completedRequestFixture(router, "disagg")
+	stored, _ := router.getPredictedLatencyContextForRequest(request)
+	prefill := createTestEndpoint("prefill-pod", 1, 1, 1)
+	stored.prefillTargetMetadata = prefill.GetMetadata()
+	stored.prefillTokensAtDispatchOnPrefill = 900
+	stored.requestsAtDispatchOnPrefill = 3
+	stored.lastSeenMetrics[ExperimentalDefaultPrefillProfile] = &fwkdl.Metrics{KVCacheUsagePercent: 0.9, WaitingQueueSize: 2, RunningRequestsSize: 3}
+
+	router.ResponseBody(context.Background(), request, &requestcontrol.Response{EndOfStream: true}, endpoint.GetMetadata())
+
+	ttftEntries, tpotEntries := trainingLabels(predictor.capturedTrainingEntries)
+	require.Len(t, ttftEntries, 1)
+	assert.Equal(t, 300.0, ttftEntries[0].ActualTTFT, "TTFT is labelled from the prefill endpoint's window")
+	assert.Equal(t, int64(900), ttftEntries[0].PrefillTokensInFlight)
+	assert.Equal(t, 3, ttftEntries[0].NumRequestRunning)
+	assert.Equal(t, 0.9, ttftEntries[0].KVCachePercentage)
+	require.Len(t, tpotEntries, 1)
+	assert.Equal(t, 25.0, tpotEntries[0].ActualTPOT, "TPOT stays on the decode endpoint's window")
 }
 
 // Test cases
@@ -355,140 +572,6 @@ func TestPredictedLatency_StreamingMode_ResponseBody_NilPredictor(t *testing.T) 
 	_, err := router.getPredictedLatencyContextForRequest(request)
 	assert.NoError(t, err)
 }
-func TestPredictedLatency_StreamingMode_ResponseBody_FirstToken(t *testing.T) {
-	router := createTestRouter()
-	mockPredictor := new(mockPredictor)
-	router.latencypredictor = mockPredictor
-
-	ctx := context.Background()
-	endpoint := createTestEndpoint("test-pod", 1, 1, 1)
-	request := createTestInferenceRequest("test", 100, 50)
-	response := &requestcontrol.Response{}
-	schedulingResult := createTestSchedulingResult(endpoint.GetMetadata())
-
-	predictedLatencyCtx := newPredictedLatencyContext(request)
-	predictedLatencyCtx.targetMetadata = endpoint.GetMetadata()
-	predictedLatencyCtx.requestReceivedTimestamp = time.Now().Add(-100 * time.Millisecond)
-	predictedLatencyCtx.schedulingResult = schedulingResult
-	predictedLatencyCtx.schedulingRequest = *request
-	predictedLatencyCtx.ttftSLO = 100
-	predictedLatencyCtx.avgTPOTSLO = 50
-	predictedLatencyCtx.incomingModelName = testModelName
-	predictedLatencyCtx.predictedTTFT = 80.0
-	predictedLatencyCtx.avgPredictedTPOT = 30.0
-
-	predictedLatencyCtx.lastSeenMetrics["prefill"] = &fwkdl.Metrics{
-		KVCacheUsagePercent: 0.5,
-		WaitingQueueSize:    1,
-		RunningRequestsSize: 1,
-	}
-	predictedLatencyCtx.lastSeenMetrics["default"] = &fwkdl.Metrics{
-		KVCacheUsagePercent: 0.5,
-		WaitingQueueSize:    1,
-		RunningRequestsSize: 1,
-	}
-
-	router.setPredictedLatencyContextForRequest(request, predictedLatencyCtx)
-
-	// Initialize the queue and add the request
-	queue := newRequestPriorityQueue()
-	queue.Add(request.Headers[reqcommon.RequestIDHeaderKey], 50.0)
-	router.runningRequestLists.Store(endpoint.GetMetadata().ID, queue)
-
-	beforeTime := time.Now()
-	router.ResponseBody(ctx, request, response, endpoint.GetMetadata())
-	afterTime := time.Now()
-
-	// Verify first token timestamp was set
-	retrievedCtx, err := router.getPredictedLatencyContextForRequest(request)
-	require.NoError(t, err)
-
-	assert.GreaterOrEqual(t, retrievedCtx.ttft, float64(100), "ttft should be set to >= 100ms")
-
-	assert.True(t, retrievedCtx.lastTokenTimestamp.After(beforeTime) ||
-		retrievedCtx.lastTokenTimestamp.Equal(beforeTime))
-	assert.True(t, retrievedCtx.lastTokenTimestamp.Before(afterTime) ||
-		retrievedCtx.lastTokenTimestamp.Equal(afterTime))
-}
-
-func TestPredictedLatency_NonStreamingMode_ResponseBody_FirstToken(t *testing.T) {
-	router := createTestRouter()
-	router.config.StreamingMode = false // Non-streaming mode
-	mockPredictor := new(mockPredictor)
-	router.latencypredictor = mockPredictor
-
-	ctx := context.Background()
-	endpoint := createTestEndpoint("test-pod", 1, 1, 1)
-	request := createTestInferenceRequest("test", 100, 50)
-	response := &requestcontrol.Response{} // EndOfStream is false
-	schedulingResult := createTestSchedulingResult(endpoint.GetMetadata())
-
-	predictedLatencyCtx := newPredictedLatencyContext(request)
-	predictedLatencyCtx.targetMetadata = endpoint.GetMetadata()
-	predictedLatencyCtx.requestReceivedTimestamp = time.Now().Add(-100 * time.Millisecond)
-	predictedLatencyCtx.schedulingResult = schedulingResult
-	predictedLatencyCtx.schedulingRequest = *request
-
-	router.setPredictedLatencyContextForRequest(request, predictedLatencyCtx)
-
-	router.ResponseBody(ctx, request, response, endpoint.GetMetadata())
-
-	// Verify that in non-streaming mode it returns early and does NOT set ttft or lastTokenTimestamp
-	retrievedCtx, err := router.getPredictedLatencyContextForRequest(request)
-	require.NoError(t, err)
-
-	assert.Zero(t, retrievedCtx.ttft, "ttft should not be set because it should early return in non-streaming mode")
-	assert.True(t, retrievedCtx.lastTokenTimestamp.IsZero(), "lastTokenTimestamp should not be set")
-}
-
-func TestPredictedLatency_StreamingMode_ResponseBody_SubsequentTokens(t *testing.T) {
-	router := createTestRouter()
-	mockPredictor := new(mockPredictor)
-	router.latencypredictor = mockPredictor
-
-	ctx := context.Background()
-	endpoint := createTestEndpoint("test-pod", 1, 1, 1)
-	request := createTestInferenceRequest("test", 100, 50)
-	response := &requestcontrol.Response{}
-	schedulingResult := createTestSchedulingResult(endpoint.GetMetadata())
-
-	predictedLatencyCtx := newPredictedLatencyContext(request)
-	predictedLatencyCtx.targetMetadata = endpoint.GetMetadata()
-	predictedLatencyCtx.requestReceivedTimestamp = time.Now()
-	predictedLatencyCtx.schedulingResult = schedulingResult
-	predictedLatencyCtx.schedulingRequest = *request
-	predictedLatencyCtx.ttftSLO = 100
-	predictedLatencyCtx.avgTPOTSLO = 50
-	predictedLatencyCtx.incomingModelName = testModelName
-	predictedLatencyCtx.predictedTTFT = 80.0
-	predictedLatencyCtx.avgPredictedTPOT = 30.0
-	// ADD THIS - populate metrics
-	predictedLatencyCtx.lastSeenMetrics["prefill"] = &fwkdl.Metrics{
-		KVCacheUsagePercent: 0.5,
-		WaitingQueueSize:    1,
-		RunningRequestsSize: 1,
-	}
-	predictedLatencyCtx.lastSeenMetrics["default"] = &fwkdl.Metrics{
-		KVCacheUsagePercent: 0.5,
-		WaitingQueueSize:    1,
-		RunningRequestsSize: 1,
-	}
-	firstTokenTime := time.Now().Add(-100 * time.Millisecond)
-
-	router.setPredictedLatencyContextForRequest(request, predictedLatencyCtx)
-
-	// Initialize the queue and add the request
-	queue := newRequestPriorityQueue()
-	queue.Add(request.Headers[reqcommon.RequestIDHeaderKey], 50.0)
-	router.runningRequestLists.Store(endpoint.GetMetadata().ID, queue)
-
-	router.ResponseBody(ctx, request, response, endpoint.GetMetadata())
-
-	// Verify token timestamp was updated
-	retrievedCtx, err := router.getPredictedLatencyContextForRequest(request)
-	require.NoError(t, err)
-	assert.True(t, retrievedCtx.lastTokenTimestamp.After(firstTokenTime))
-}
 
 func TestPredictedLatency_StreamingMode_ResponseBody_FinalToken_QueueNotFound(t *testing.T) {
 	router := createTestRouter()
@@ -684,105 +767,6 @@ func TestPredictedLatency_StreamingMode_ResponseBody_FinalToken_NoSLOs(t *testin
 	assert.Error(t, err)
 }
 
-func TestPredictedLatency_StreamingMode_ResponseBody_FinalToken(t *testing.T) {
-	router := createTestRouter()
-	router.config.StreamingMode = true
-	mockPredictor := new(mockPredictor)
-	router.latencypredictor = mockPredictor
-
-	ctx := context.Background()
-	endpoint := createTestEndpoint("test-pod", 1, 1, 1)
-	request := createTestInferenceRequest("test", 100, 50)
-	response := &requestcontrol.Response{EndOfStream: true} // True
-	schedulingResult := createTestSchedulingResult(endpoint.GetMetadata())
-
-	predictedLatencyCtx := newPredictedLatencyContext(request)
-	predictedLatencyCtx.targetMetadata = endpoint.GetMetadata()
-	predictedLatencyCtx.requestReceivedTimestamp = time.Now().Add(-200 * time.Millisecond)
-	predictedLatencyCtx.schedulingResult = schedulingResult
-	predictedLatencyCtx.schedulingRequest = *request
-	predictedLatencyCtx.ttft = 100 // TTFT > 0: means first token already arrived (False for FirstChunk)
-
-	router.setPredictedLatencyContextForRequest(request, predictedLatencyCtx)
-
-	// Initialize the queue and add the request
-	queue := newRequestPriorityQueue()
-	queue.Add(request.Headers[reqcommon.RequestIDHeaderKey], 50.0)
-	router.runningRequestLists.Store(endpoint.GetMetadata().ID, queue)
-
-	router.ResponseBody(ctx, request, response, endpoint.GetMetadata())
-
-	// Context should be deleted when EndOfStream is reached
-	_, err := router.getPredictedLatencyContextForRequest(request)
-	assert.Error(t, err)
-}
-
-func TestPredictedLatency_StreamingMode_ResponseBody_SingleChunk(t *testing.T) {
-	router := createTestRouter()
-	router.config.StreamingMode = true
-	mockPredictor := new(mockPredictor)
-	router.latencypredictor = mockPredictor
-
-	ctx := context.Background()
-	endpoint := createTestEndpoint("test-pod", 1, 1, 1)
-	request := createTestInferenceRequest("test", 100, 50)
-	response := &requestcontrol.Response{EndOfStream: true} // True
-	schedulingResult := createTestSchedulingResult(endpoint.GetMetadata())
-
-	predictedLatencyCtx := newPredictedLatencyContext(request)
-	predictedLatencyCtx.targetMetadata = endpoint.GetMetadata()
-	predictedLatencyCtx.requestReceivedTimestamp = time.Now().Add(-150 * time.Millisecond)
-	predictedLatencyCtx.schedulingResult = schedulingResult
-	predictedLatencyCtx.schedulingRequest = *request
-	// ttft == 0: First chunk and Final chunk at the same time
-
-	router.setPredictedLatencyContextForRequest(request, predictedLatencyCtx)
-
-	// Initialize the queue and add the request
-	queue := newRequestPriorityQueue()
-	queue.Add(request.Headers[reqcommon.RequestIDHeaderKey], 50.0)
-	router.runningRequestLists.Store(endpoint.GetMetadata().ID, queue)
-
-	router.ResponseBody(ctx, request, response, endpoint.GetMetadata())
-
-	// Context should be deleted when EndOfStream is reached
-	_, err := router.getPredictedLatencyContextForRequest(request)
-	assert.Error(t, err)
-}
-
-func TestPredictedLatency_NonStreamingMode_ResponseBody_FinalToken(t *testing.T) {
-	router := createTestRouter()
-	router.config.StreamingMode = false
-	mockPredictor := new(mockPredictor)
-	router.latencypredictor = mockPredictor
-
-	ctx := context.Background()
-	endpoint := createTestEndpoint("test-pod", 1, 1, 1)
-	request := createTestInferenceRequest("test", 100, 50)
-	response := &requestcontrol.Response{EndOfStream: true} // True
-	schedulingResult := createTestSchedulingResult(endpoint.GetMetadata())
-
-	predictedLatencyCtx := newPredictedLatencyContext(request)
-	predictedLatencyCtx.targetMetadata = endpoint.GetMetadata()
-	predictedLatencyCtx.requestReceivedTimestamp = time.Now().Add(-300 * time.Millisecond)
-	predictedLatencyCtx.schedulingResult = schedulingResult
-	predictedLatencyCtx.schedulingRequest = *request
-	// ttft == 0: For non-streaming, TTFT happens when EndOfStream is true
-
-	router.setPredictedLatencyContextForRequest(request, predictedLatencyCtx)
-
-	// Initialize the queue and add the request
-	queue := newRequestPriorityQueue()
-	queue.Add(request.Headers[reqcommon.RequestIDHeaderKey], 50.0)
-	router.runningRequestLists.Store(endpoint.GetMetadata().ID, queue)
-
-	router.ResponseBody(ctx, request, response, endpoint.GetMetadata())
-
-	// Context should be deleted when EndOfStream is reached
-	_, err := router.getPredictedLatencyContextForRequest(request)
-	assert.Error(t, err)
-}
-
 // TestPredictedLatency_ResponseBody_CleansUpContext_WhenPreRequestSkipped
 // covers the race where the director's Produce window times out: PreRequest
 // sees no SLO context and returns early, but the Produce goroutine later
@@ -790,7 +774,6 @@ func TestPredictedLatency_NonStreamingMode_ResponseBody_FinalToken(t *testing.T)
 // at EOS so it does not leak.
 func TestPredictedLatency_ResponseBody_CleansUpContext_WhenPreRequestSkipped(t *testing.T) {
 	router := createTestRouter()
-	router.config.StreamingMode = false
 	mockPredictor := new(mockPredictor)
 	router.latencypredictor = mockPredictor
 
@@ -862,8 +845,6 @@ func TestPredictedLatencyContext_Fields(t *testing.T) {
 	assert.NotNil(t, ctx.lastSeenMetrics)
 	assert.NotNil(t, ctx.prefixCacheScoresForEndpoints)
 	assert.NotNil(t, ctx.predictionsForScheduling)
-	assert.Empty(t, ctx.predictedTPOTObservations)
-	assert.Zero(t, ctx.generatedTokenCount)
 	assert.Zero(t, ctx.ttft)
 	assert.Zero(t, ctx.avgTPOT)
 	assert.Nil(t, ctx.targetMetadata)

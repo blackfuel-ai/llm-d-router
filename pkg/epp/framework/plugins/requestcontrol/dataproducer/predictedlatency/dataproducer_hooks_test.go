@@ -30,7 +30,7 @@ import (
 )
 
 func TestProducesConsumes(t *testing.T) {
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, DefaultConfig, nil)
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, DefaultConfig, nil)
 
 	produces := pl.Produces()
 	expectedProduceKey := attrlatency.LatencyPredictionInfoDataKey.WithNonEmptyProducerName(pl.TypedName().Name)
@@ -45,7 +45,7 @@ func TestProducesConsumes(t *testing.T) {
 func TestConsumes_EncoderCacheFeatureEnabled(t *testing.T) {
 	cfg := DefaultConfig
 	cfg.UseEncoderCacheFeatures = true
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
 
 	consumes := pl.Consumes()
 	assert.Contains(t, consumes.Required, attrmm.EncoderCacheMatchInfoKey)
@@ -59,7 +59,7 @@ func TestProduce_CapturesEncoderCacheSizes(t *testing.T) {
 	cfg := DefaultConfig
 	cfg.PredictInProduce = false
 	cfg.UseEncoderCacheFeatures = true
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
 
 	request := createTestInferenceRequest("encoder-test", 0, 0)
 	matched := createTestEndpoint("pod-matched", 0.1, 0, 0)
@@ -85,7 +85,7 @@ func TestProduce_ClampsInconsistentEncoderMatchData(t *testing.T) {
 	cfg := DefaultConfig
 	cfg.PredictInProduce = false
 	cfg.UseEncoderCacheFeatures = true
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
 
 	request := createTestInferenceRequest("encoder-clamp-test", 0, 0)
 	endpoint := createTestEndpoint("pod-a", 0.1, 0, 0)
@@ -107,7 +107,7 @@ func TestProduce_ClampsInconsistentEncoderMatchData(t *testing.T) {
 func TestProduce_EncoderCacheFeatureDisabledIgnoresMatchData(t *testing.T) {
 	cfg := DefaultConfig
 	cfg.PredictInProduce = false
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
 
 	request := createTestInferenceRequest("encoder-disabled-test", 0, 0)
 	endpoint := createTestEndpoint("pod-a", 0.1, 0, 0)
@@ -130,7 +130,7 @@ func TestProduce_EncoderCacheFeatureDisabledIgnoresMatchData(t *testing.T) {
 func TestProduce_CancelledContextDoesNotPublish(t *testing.T) {
 	cfg := DefaultConfig
 	cfg.PredictInProduce = false // skip the prediction sidecar path
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
 
 	request := createTestInferenceRequest("cancel-test", 0, 0)
 	endpoint := createTestEndpoint("pod-a", 0.1, 0, 0)
@@ -150,7 +150,7 @@ func TestProduce_CancelledContextDoesNotPublish(t *testing.T) {
 func TestProduce_LiveContextPublishes(t *testing.T) {
 	cfg := DefaultConfig
 	cfg.PredictInProduce = false
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
 
 	request := createTestInferenceRequest("live-test", 0, 0)
 	endpoint := createTestEndpoint("pod-a", 0.1, 0, 0)

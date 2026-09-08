@@ -38,10 +38,8 @@ func createTestEndpointWithLabels(name string, kvCacheUsage float64, runningRequ
 	}, nil)
 }
 
-func TestValidatePrediction_StreamingMode(t *testing.T) {
-	cfg := DefaultConfig
-	cfg.StreamingMode = true
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, cfg, nil)
+func TestValidatePrediction(t *testing.T) {
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, testConfig(), nil)
 
 	tests := []struct {
 		name            string
@@ -115,33 +113,33 @@ func TestValidatePrediction_StreamingMode(t *testing.T) {
 	}
 }
 
-func TestValidatePrediction_NonStreamingMode(t *testing.T) {
-	config := DefaultConfig
-	config.StreamingMode = false
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, config, nil)
+// TestValidatePrediction_TPOTGatesEveryRequest asserts that a TPOT prediction
+// over the SLO invalidates the endpoint whatever the response mode: the
+// producer trains TPOT for every request, so the prediction is meaningful for
+// every request.
+func TestValidatePrediction_TPOTGatesEveryRequest(t *testing.T) {
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, testConfig(), nil)
 
 	ctx := &predictedLatencyCtx{
 		ttftSLO:    100,
 		avgTPOTSLO: 30,
 	}
 
-	// In non-streaming mode, TPOT is always valid regardless of prediction
 	pred := &latencypredictor.PredictionResponse{TTFT: 50, TPOT: 999}
 	ttftOk, tpotOk, valid, headroom, _ := pl.validatePrediction(pred, ctx, 0)
 
 	assert.True(t, ttftOk, "TTFT should be valid")
-	assert.True(t, tpotOk, "TPOT should always be valid in non-streaming mode")
-	assert.True(t, valid, "overall should be valid")
-	assert.Equal(t, 0.0, headroom, "headroom should be 0 in non-streaming mode")
+	assert.False(t, tpotOk, "TPOT over the SLO must be invalid")
+	assert.False(t, valid, "overall should be invalid")
+	assert.Less(t, headroom, 0.0, "headroom must be negative")
 }
 
 func TestValidatePrediction_PrefillEndpointNeutralizeTPOT(t *testing.T) {
 	// In disaggregated serving, prefill endpoints should have TPOT neutralized.
 	// Even if TPOT prediction violates SLO, prefill should be valid if TTFT is OK.
-	config := DefaultConfig
+	config := testConfig()
 	config.EndpointRoleLabel = "role"
-	config.StreamingMode = true
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, config, nil)
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, config, nil)
 
 	prefillEp := createTestEndpointWithLabels("prefill-pod", 0.3, 0, 0, map[string]string{"role": "prefill"})
 	decodeEp := createTestEndpointWithLabels("decode-pod", 0.3, 0, 0, map[string]string{"role": "decode"})
@@ -210,7 +208,7 @@ func TestValidatePrediction_PrefillEndpointNeutralizeTPOT(t *testing.T) {
 }
 
 func TestUpdateRequestContextWithPredictions(t *testing.T) {
-	pl := NewPredictedLatency(LatencyDataProviderPluginType, DefaultConfig, nil)
+	pl := newTestPredictedLatency(LatencyDataProviderPluginType, testConfig(), nil)
 	ctx := &predictedLatencyCtx{
 		predictionsForScheduling: make(map[string]endpointPredictionResult),
 	}
