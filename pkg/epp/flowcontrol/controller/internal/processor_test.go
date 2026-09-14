@@ -1059,6 +1059,44 @@ func TestProcessor(t *testing.T) {
 				}
 			})
 
+			t.Run("should purge finalized heads before consulting the saturation detector", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				// A higher band whose only item is already finalized in place, and a lower band with a live item.
+				// The cycle must clear the zombie before the detector is consulted and then dispatch the live item.
+				h := newTestHarness(t, 1*time.Hour) // No background sweep: the dispatch cycle alone must clear the head.
+				keyHigh := flowcontrol.FlowKey{ID: "flow-high", Priority: 20}
+				keyLow := flowcontrol.FlowKey{ID: "flow-low", Priority: 10}
+				qHigh := h.addQueue(keyHigh)
+				qLow := h.addQueue(keyLow)
+				zombie := h.newTestItem("item-zombie", keyHigh, testTTL)
+				live := h.newTestItem("item-live", keyLow, testTTL)
+				require.NoError(t, qHigh.Add(zombie))
+				require.NoError(t, qLow.Add(live))
+				zombie.FinalizeWithOutcome(types.QueueOutcomeEvictedContextCancelled, types.ErrContextCancelled)
+
+				var detectorCalls atomic.Int32
+				h.saturationDetector.SaturationFunc = func(_ context.Context, _ []fwkdl.Endpoint) float64 {
+					detectorCalls.Add(1)
+					assert.Equal(t, 0, qHigh.Len(),
+						"the finalized head must be purged before the detector spends its dispatch budget")
+					return 0.0
+				}
+
+				// --- ACT ---
+				dispatched := h.processor.dispatchCycle(context.Background())
+
+				// --- ASSERT ---
+				assert.True(t, dispatched, "the live item should be dispatched")
+				assert.Equal(t, int32(1), detectorCalls.Load(), "the detector is consulted exactly once per cycle")
+				assert.Equal(t, 0, qLow.Len(), "the dispatched item should have left its queue")
+				assert.Equal(t, types.QueueOutcomeDispatched, live.FinalState().Outcome, "the live item should be dispatched")
+				assert.Equal(t, types.QueueOutcomeEvictedContextCancelled, zombie.FinalState().Outcome,
+					"purging must not rewrite the zombie's outcome")
+				assert.Equal(t, uint64(1), h.processor.dropCounts[types.QueueOutcomeEvictedContextCancelled].Load(),
+					"the purged zombie should be counted as a drop")
+			})
+
 			t.Run("should guarantee strict priority by starving lower priority items", func(t *testing.T) {
 				t.Parallel()
 				// --- ARRANGE ---

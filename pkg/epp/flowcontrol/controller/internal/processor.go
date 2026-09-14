@@ -410,6 +410,10 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	if empty := len(pool) == 0; empty != p.regime.Load().empty {
 		p.regime.Store(&regimeSample{empty: empty, since: p.clock.Now()})
 	}
+	// A saturation detector may carry a dispatch budget that a call consumes, so it is consulted only once the head
+	// each band would fund is live: a head finalized in place and awaiting the cleanup sweep would otherwise spend the
+	// budget on a no-op dispatch.
+	p.purgeFinalizedHeads()
 	saturation := p.saturationDetector.Saturation(ctx, pool)
 
 	// Record pool saturation metric
@@ -460,6 +464,39 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 		return true
 	}
 	return false
+}
+
+// purgeFinalizedHeads removes, from the head of every active queue, the items already finalized (a request cancelled or
+// expired while queued) so that the next item selection lands on a live request. Finalized items further back in a
+// queue are left to the cleanup sweep. Removal is idempotent with the sweep: a head the sweep removed first is simply
+// not found. The pass over one queue is bounded by the queue's length on entry and stops when a removal does not
+// advance the head, so a queue that declines the removal cannot stall the dispatch cycle.
+func (p *Processor) purgeFinalizedHeads() {
+	for _, priority := range p.registry.AllOrderedPriorityLevels() {
+		band, err := p.registry.PriorityBandAccessor(priority)
+		if err != nil {
+			continue
+		}
+		band.IterateQueues(func(queue flowcontrol.FlowQueueAccessor) bool {
+			var previous flowcontrol.QueueItemHandle
+			for remaining := queue.Len(); remaining > 0; remaining-- {
+				head, ok := queue.Peek().(*FlowItem)
+				if !ok || head == nil || head.FinalState() == nil || head.Handle() == previous {
+					return true
+				}
+				managedQ, err := p.registry.ManagedQueue(queue.FlowKey())
+				if err != nil {
+					return true
+				}
+				if _, err := managedQ.Remove(head.Handle()); err != nil {
+					return true
+				}
+				p.recordDrop(head.FinalState().Outcome)
+				previous = head.Handle()
+			}
+			return true
+		})
+	}
 }
 
 // ceilingsBuffer returns the reusable ceilings buffer sized to n, every element reset to 1.0 (no
