@@ -893,10 +893,10 @@ func TestGracefulShutdownDrainsQueuedRequests(t *testing.T) {
 // Production Edge Cases
 // ============================================================================
 
-// TestZombieCapacityStarvation verifies that finalized items still in the queue (zombies) consume capacity until the
-// cleanup sweep runs. If the sweep interval is long, new requests are falsely rejected because capacity is held by dead
-// items.
-func TestZombieCapacityStarvation(t *testing.T) {
+// TestZombieHeadsReclaimedByDispatchCycle verifies that finalized items at the head of a queue (zombies) are removed
+// by the dispatch cycle rather than held until the cleanup sweep, so their capacity is released to new requests even
+// when the sweep interval is long.
+func TestZombieHeadsReclaimedByDispatchCycle(t *testing.T) {
 	t.Parallel()
 
 	detector := newBlockedDetector()
@@ -923,9 +923,12 @@ func TestZombieCapacityStarvation(t *testing.T) {
 	release := h.fillQueue(t, key, 3, 100, func() bool { return h.reg.Stats().Global.Len == 3 })
 	release()
 
-	// All 3 are finalized, but cleanup hasn't run (interval=10s).
-	// The new request is rejected because zombies still consume capacity
-	// in the registry's atomic counters.
+	// All 3 are finalized and cleanup has not run (interval=10s). Every zombie reaches the head of the queue in turn,
+	// and the dispatch cycle removes it there. The capacity check runs at enqueue, before that cycle, so the new
+	// request is sent only once the reclaim is observable in registry stats.
+	require.Eventually(t, func() bool { return h.reg.Stats().Global.Len == 0 }, time.Second, time.Millisecond,
+		"zombie heads should be reclaimed by the dispatch cycle before the cleanup sweep runs")
+
 	newResult := make(chan dispatchResult, 1)
 	go func() {
 		reqCtx, reqCancel := context.WithTimeout(h.ctx, 200*time.Millisecond)
@@ -937,10 +940,11 @@ func TestZombieCapacityStarvation(t *testing.T) {
 
 	select {
 	case r := <-newResult:
-		// Zombie capacity starvation: the 3 finalized items still occupy
-		// capacity slots until the cleanup sweep reclaims them (interval=10s).
-		require.Equal(t, fcTypes.QueueOutcomeRejectedCapacity, r.outcome,
-			"post-zombie request should be rejected -- finalized items consume capacity until cleanup sweep runs")
+		// The detector is blocked, so the queued request runs out its own budget: an eviction proves it held a
+		// capacity slot the zombies had released.
+		require.NotEqual(t, fcTypes.QueueOutcomeRejectedCapacity, r.outcome,
+			"post-zombie request must not be rejected for capacity: zombie heads are reclaimed by the dispatch cycle")
+		require.ErrorIs(t, r.err, fcTypes.ErrEvicted, "post-zombie request should have been queued and then evicted")
 	case <-time.After(5 * time.Second):
 		t.Fatal("post-zombie request hung")
 	}
