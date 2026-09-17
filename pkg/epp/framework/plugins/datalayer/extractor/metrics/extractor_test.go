@@ -19,6 +19,7 @@ package metrics
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -263,6 +264,85 @@ func TestExtractorMultiEngine(t *testing.T) {
 	_ = extractor.Extract(ctx, fwkdl.PollInput[sourcemetrics.PrometheusMetricMap]{Payload: data, Endpoint: epSgl})
 	if epSgl.GetMetrics().WaitingQueueSize != 20 {
 		t.Errorf("sglang: expected queue size 20, got %v", epSgl.GetMetrics().WaitingQueueSize)
+	}
+}
+
+func TestExtractorSumsEnginesOfDataParallelPod(t *testing.T) {
+	ctx := context.Background()
+
+	registry := NewMappingRegistry()
+	mapping, err := NewMapping(defaultTotalQueuedRequestsMetric, defaultTotalRunningRequestsMetric,
+		defaultKvCacheUsagePercentageMetric, "", "")
+	if err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+	if err := registry.Register(DefaultEngineType, mapping); err != nil {
+		t.Fatalf("failed to register mapping: %v", err)
+	}
+	extractor, err := NewCoreMetricsExtractor(registry, "")
+	if err != nil {
+		t.Fatalf("failed to create extractor: %v", err)
+	}
+
+	perEngine := func(values ...float64) *dto.MetricFamily {
+		series := make([]*dto.Metric, 0, len(values))
+		for i, v := range values {
+			series = append(series, &dto.Metric{
+				Label: []*dto.LabelPair{{Name: proto.String("engine"), Value: proto.String(strconv.Itoa(i))}},
+				Gauge: &dto.Gauge{Value: ptr.To(v)},
+			})
+		}
+		return &dto.MetricFamily{Type: dto.MetricType_GAUGE.Enum(), Metric: series}
+	}
+
+	tests := []struct {
+		name        string
+		data        sourcemetrics.PrometheusMetricMap
+		wantWaiting int
+		wantRunning int
+		wantKV      float64
+	}{
+		{
+			name: "four engines",
+			data: sourcemetrics.PrometheusMetricMap{
+				defaultTotalQueuedRequestsMetric:    perEngine(6, 10, 11, 7),
+				defaultTotalRunningRequestsMetric:   perEngine(40, 38, 41, 37),
+				defaultKvCacheUsagePercentageMetric: perEngine(0.52, 0.91, 0.78, 0.60),
+			},
+			wantWaiting: 34,
+			wantRunning: 156,
+			wantKV:      0.91,
+		},
+		{
+			name: "single engine",
+			data: sourcemetrics.PrometheusMetricMap{
+				defaultTotalQueuedRequestsMetric:    perEngine(6),
+				defaultTotalRunningRequestsMetric:   perEngine(40),
+				defaultKvCacheUsagePercentageMetric: perEngine(0.52),
+			},
+			wantWaiting: 6,
+			wantRunning: 40,
+			wantKV:      0.52,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ep := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{}, nil)
+			if err := extractor.Extract(ctx, fwkdl.PollInput[sourcemetrics.PrometheusMetricMap]{Payload: tt.data, Endpoint: ep}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got := ep.GetMetrics()
+			if got.WaitingQueueSize != tt.wantWaiting {
+				t.Errorf("WaitingQueueSize: want %d, got %d", tt.wantWaiting, got.WaitingQueueSize)
+			}
+			if got.RunningRequestsSize != tt.wantRunning {
+				t.Errorf("RunningRequestsSize: want %d, got %d", tt.wantRunning, got.RunningRequestsSize)
+			}
+			if got.KVCacheUsagePercent != tt.wantKV {
+				t.Errorf("KVCacheUsagePercent: want %v, got %v", tt.wantKV, got.KVCacheUsagePercent)
+			}
+		})
 	}
 }
 
