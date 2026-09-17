@@ -382,8 +382,8 @@ func TestExtractorReadsEveryEngineOfDataParallelPod(t *testing.T) {
 		{
 			name:        "four engines",
 			data:        fourEngines,
-			wantWaiting: 34,
-			wantRunning: 156,
+			wantWaiting: 9,
+			wantRunning: 39,
 			wantKV:      0.91,
 		},
 		{
@@ -406,8 +406,8 @@ func TestExtractorReadsEveryEngineOfDataParallelPod(t *testing.T) {
 				defaultKvCacheUsagePercentageMetric: perEngine(0.1, 0.2, 0.3, 0.4),
 			},
 			wantErr:     true,
-			wantWaiting: 34,
-			wantRunning: 100,
+			wantWaiting: 9,
+			wantRunning: 25,
 			wantKV:      0.4,
 		},
 	}
