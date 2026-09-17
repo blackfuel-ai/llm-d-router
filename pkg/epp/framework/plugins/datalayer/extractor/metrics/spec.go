@@ -126,6 +126,53 @@ func (spec *Spec) getLatestMetric(families sourcemetrics.PrometheusMetricMap) (*
 	return latest, nil
 }
 
+// aggregation selects how the series of one metric family fold into a single value.
+type aggregation int
+
+const (
+	// aggregateSum adds the series, for additive gauges such as request counts.
+	aggregateSum aggregation = iota
+	// aggregateMax keeps the largest series, for ratios such as KV cache usage
+	// where the series closest to its limit describes the pod.
+	aggregateMax
+)
+
+// aggregateMetric folds every series matching Spec into one value. A model
+// server running several engines in one pod (e.g. vLLM data parallelism with
+// internal load balancing) exposes one series per engine, and the pod-level
+// value covers all of them.
+func (spec *Spec) aggregateMetric(families sourcemetrics.PrometheusMetricMap, agg aggregation) (float64, error) {
+	family, err := extractFamily(spec, families)
+	if err != nil {
+		return 0, err
+	}
+
+	var result float64
+	matched := false
+
+	for _, metric := range family.GetMetric() {
+		if !spec.labelsMatch(metric.GetLabel()) {
+			continue
+		}
+		value := extractValue(metric)
+		switch {
+		case !matched:
+			result = value
+		case agg == aggregateSum:
+			result += value
+		case value > result:
+			result = value
+		}
+		matched = true
+	}
+
+	if !matched {
+		return 0, fmt.Errorf("no matching metric found for %q with labels %v", spec.Name, spec.Labels)
+	}
+
+	return result, nil
+}
+
 // labelsMatch checks if metric labels match the specification labels.
 func (spec *Spec) labelsMatch(metricLabels []*dto.LabelPair) bool {
 	if len(spec.Labels) == 0 {
