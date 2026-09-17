@@ -334,7 +334,7 @@ func TestBuiltinAtomEngine(t *testing.T) {
 	}
 }
 
-func TestExtractorSumsEnginesOfDataParallelPod(t *testing.T) {
+func TestExtractorReadsEveryEngineOfDataParallelPod(t *testing.T) {
 	ctx := context.Background()
 
 	registry := NewMappingRegistry()
@@ -376,8 +376,8 @@ func TestExtractorSumsEnginesOfDataParallelPod(t *testing.T) {
 				defaultTotalRunningRequestsMetric:   perEngine(40, 38, 41, 37),
 				defaultKvCacheUsagePercentageMetric: perEngine(0.52, 0.91, 0.78, 0.60),
 			},
-			wantWaiting: 34,
-			wantRunning: 156,
+			wantWaiting: 9,
+			wantRunning: 39,
 			wantKV:      0.91,
 		},
 		{
