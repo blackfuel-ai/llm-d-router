@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -103,19 +104,19 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 	updated := false
 
 	if spec := mapping.TotalQueuedRequests; spec != nil { // extract queued requests
-		if value, err := spec.aggregateMetric(families, aggregateSum); err != nil {
+		if value, err := spec.aggregateMetric(families, aggregateMean); err != nil {
 			errs = append(errs, err)
 		} else {
-			clone.WaitingQueueSize = int(value)
+			clone.WaitingQueueSize = int(math.Ceil(value))
 			updated = true
 		}
 	}
 
 	if spec := mapping.TotalRunningRequests; spec != nil { // extract running requests
-		if value, err := spec.aggregateMetric(families, aggregateSum); err != nil {
+		if value, err := spec.aggregateMetric(families, aggregateMean); err != nil {
 			errs = append(errs, err)
 		} else {
-			clone.RunningRequestsSize = int(value)
+			clone.RunningRequestsSize = int(math.Ceil(value))
 			updated = true
 		}
 	}

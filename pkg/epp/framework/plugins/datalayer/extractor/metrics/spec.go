@@ -130,8 +130,10 @@ func (spec *Spec) getLatestMetric(families sourcemetrics.PrometheusMetricMap) (*
 type aggregation int
 
 const (
-	// aggregateSum adds the series, for additive gauges such as request counts.
-	aggregateSum aggregation = iota
+	// aggregateMean averages the series, for per-engine gauges such as request
+	// counts: the value reads as the load of one engine, so a threshold or a
+	// comparison between pods means the same whatever the number of engines.
+	aggregateMean aggregation = iota
 	// aggregateMax keeps the largest series, for ratios such as KV cache usage
 	// where the series closest to its limit describes the pod.
 	aggregateMax
@@ -148,7 +150,7 @@ func (spec *Spec) aggregateMetric(families sourcemetrics.PrometheusMetricMap, ag
 	}
 
 	var result float64
-	matched := false
+	matched := 0
 
 	for _, metric := range family.GetMetric() {
 		if !spec.labelsMatch(metric.GetLabel()) {
@@ -156,20 +158,23 @@ func (spec *Spec) aggregateMetric(families sourcemetrics.PrometheusMetricMap, ag
 		}
 		value := extractValue(metric)
 		switch {
-		case !matched:
+		case matched == 0:
 			result = value
-		case agg == aggregateSum:
+		case agg == aggregateMean:
 			result += value
 		case value > result:
 			result = value
 		}
-		matched = true
+		matched++
 	}
 
-	if !matched {
+	if matched == 0 {
 		return 0, fmt.Errorf("no matching metric found for %q with labels %v", spec.Name, spec.Labels)
 	}
 
+	if agg == aggregateMean {
+		result /= float64(matched)
+	}
 	return result, nil
 }
 
