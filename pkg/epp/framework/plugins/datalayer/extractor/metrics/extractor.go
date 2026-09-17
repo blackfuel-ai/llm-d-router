@@ -104,10 +104,10 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 	updated := false
 
 	if spec := mapping.TotalQueuedRequests; spec != nil { // extract queued requests
-		if value, err := spec.aggregateMetric(families, aggregateMean); err != nil {
+		if value, err := spec.aggregateMetric(families, aggregateMax); err != nil {
 			errs = append(errs, err)
 		} else {
-			clone.WaitingQueueSize = int(math.Ceil(value))
+			clone.WaitingQueueSize = int(value)
 			updated = true
 		}
 	}
