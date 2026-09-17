@@ -24,7 +24,7 @@ The Core Metrics Extractor is a data layer plugin responsible for extracting mod
 
 A model server that runs several engines in one Pod (e.g. vLLM data parallelism with internal load balancing) exposes one series per engine, distinguished by a label such as `engine`. The pod-level attributes cover every series that matches the metric spec:
 
--   `WaitingQueueSize` and `RunningRequestsSize` are the sum over the matching series.
+-   `WaitingQueueSize` and `RunningRequestsSize` are the mean over the matching series, rounded up: the load of one engine, so a queue-depth threshold or a comparison between Pods means the same whatever the number of engines, and a Pod with any request queued never reads zero.
 -   `KVCacheUsagePercent` is the maximum over the matching series: the engine closest to its limit describes the Pod, and the value stays a fraction.
 
 A family with a single matching series yields that series' value. LoRA, cache configuration and custom metrics read one series.

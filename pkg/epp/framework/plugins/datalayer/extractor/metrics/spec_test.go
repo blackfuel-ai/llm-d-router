@@ -547,27 +547,27 @@ func TestAggregateMetric(t *testing.T) {
 		want    float64
 		wantErr bool
 	}{
-		{name: "sum over every engine", spec: &Spec{Name: "vllm:num_requests_waiting"}, agg: aggregateSum, want: 34},
+		{name: "mean over every engine", spec: &Spec{Name: "vllm:num_requests_waiting"}, agg: aggregateMean, want: 8.5},
 		{name: "max over every engine", spec: &Spec{Name: "vllm:num_requests_waiting"}, agg: aggregateMax, want: 11},
 		{
-			name: "sum only label-matching series",
+			name: "mean only label-matching series",
 			spec: &Spec{Name: "nv_trt_llm_request_metrics", Labels: map[string]string{"request_type": "waiting"}},
-			agg:  aggregateSum, want: 7,
+			agg:  aggregateMean, want: 3.5,
 		},
 		{
 			name: "max only label-matching series",
 			spec: &Spec{Name: "nv_trt_llm_request_metrics", Labels: map[string]string{"request_type": "waiting"}},
 			agg:  aggregateMax, want: 4,
 		},
-		{name: "single series sum", spec: &Spec{Name: "single"}, agg: aggregateSum, want: 5},
+		{name: "single series mean", spec: &Spec{Name: "single"}, agg: aggregateMean, want: 5},
 		{name: "single series max", spec: &Spec{Name: "single"}, agg: aggregateMax, want: 5},
 		{
 			name: "no matching series",
 			spec: &Spec{Name: "vllm:num_requests_waiting", Labels: map[string]string{"engine": "9"}},
-			agg:  aggregateSum, wantErr: true,
+			agg:  aggregateMean, wantErr: true,
 		},
-		{name: "family not found", spec: &Spec{Name: "absent"}, agg: aggregateSum, wantErr: true},
-		{name: "nil spec", spec: nil, agg: aggregateSum, wantErr: true},
+		{name: "family not found", spec: &Spec{Name: "absent"}, agg: aggregateMean, wantErr: true},
+		{name: "nil spec", spec: nil, agg: aggregateMean, wantErr: true},
 	}
 
 	for _, tt := range tests {
