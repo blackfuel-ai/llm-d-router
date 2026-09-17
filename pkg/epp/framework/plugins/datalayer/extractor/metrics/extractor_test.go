@@ -309,7 +309,7 @@ func TestExtractorReadsEveryEngineOfDataParallelPod(t *testing.T) {
 				defaultTotalRunningRequestsMetric:   perEngine(40, 38, 41, 37),
 				defaultKvCacheUsagePercentageMetric: perEngine(0.52, 0.91, 0.78, 0.60),
 			},
-			wantWaiting: 9,
+			wantWaiting: 11,
 			wantRunning: 39,
 			wantKV:      0.91,
 		},

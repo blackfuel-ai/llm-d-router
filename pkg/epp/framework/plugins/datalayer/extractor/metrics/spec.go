@@ -134,8 +134,9 @@ const (
 	// counts: the value reads as the load of one engine, so a threshold or a
 	// comparison between pods means the same whatever the number of engines.
 	aggregateMean aggregation = iota
-	// aggregateMax keeps the largest series, for ratios such as KV cache usage
-	// where the series closest to its limit describes the pod.
+	// aggregateMax keeps the largest series, for readings where the engine
+	// closest to its limit describes the pod: KV cache usage, and the waiting
+	// queue, since engines stepping in lockstep all wait on the most blocked one.
 	aggregateMax
 )
 
