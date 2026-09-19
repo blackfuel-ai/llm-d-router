@@ -1315,6 +1315,7 @@ func TestOpenAIParser_Claims(t *testing.T) {
 			chatCompletionsAPI + "/render",
 			completionsAPI + "/render",
 			imagesGenerationsAPI,
+			tokenizeAPI,
 		},
 		Protocols: []v1.AppProtocol{v1.AppProtocolH2C, v1.AppProtocolHTTP},
 	}
@@ -1540,5 +1541,52 @@ func TestOpenAIParser_ParseRequest_MaxOutputTokens(t *testing.T) {
 				t.Errorf("MaxOutputTokens mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+
+// The ai-gateway rewrites Anthropic /v1/messages/count_tokens onto vLLM's /tokenize
+// for OpenAI-schema backends. Before this parser claimed the path, the registry
+// answered "no parser registered matching path suffix for: /tokenize" and every such
+// request became a 400 that never reached the model server.
+func TestOpenAIParser_ParseRequest_Tokenize(t *testing.T) {
+	// A tokenize body carries messages, not the prompt the completions extractor
+	// demands — the default API-type fallthrough would reject it.
+	body := []byte(`{"model":"deepseek-ai/DeepSeek-V4-Flash-0731","messages":[{"role":"user","content":"hello"}],"add_generation_prompt":true}`)
+
+	for _, path := range []string{"/tokenize", "/tokenize?beta=true"} {
+		t.Run(path, func(t *testing.T) {
+			parser := NewOpenAIParser()
+			got, err := parser.ParseRequest(context.Background(), body, map[string]string{":path": path})
+			if err != nil {
+				t.Fatalf("ParseRequest() error = %v, want nil", err)
+			}
+			if !got.SkipResponseProcessing {
+				t.Error("SkipResponseProcessing = false, want true: /tokenize carries no usage to meter")
+			}
+			raw, ok := got.Body.Payload.(fwkrh.RawPayload)
+			if !ok {
+				t.Fatalf("Payload type = %T, want RawPayload (forwarded unchanged)", got.Body.Payload)
+			}
+			if string(raw) != string(body) {
+				t.Errorf("Payload = %s, want the body forwarded unchanged", raw)
+			}
+			// RawPayload must not satisfy MarshalablePayload, or the director would
+			// attempt a model rewrite and fail with "model not found in request body".
+			if _, ok := got.Body.Payload.(fwkrh.MarshalablePayload); ok {
+				t.Error("RawPayload satisfies MarshalablePayload; director would attempt a model rewrite")
+			}
+		})
+	}
+}
+
+// /detokenize also ends in "tokenize"; the "/" anchor must keep it out of the
+// passthrough branch so it is parsed (and rejected) as before.
+func TestOpenAIParser_ParseRequest_DetokenizeIsNotTokenize(t *testing.T) {
+	parser := NewOpenAIParser()
+	body := []byte(`{"model":"m","tokens":[1,2,3]}`)
+	got, err := parser.ParseRequest(context.Background(), body, map[string]string{":path": "/detokenize"})
+	if err == nil && got != nil && got.SkipResponseProcessing {
+		t.Error("/detokenize took the /tokenize passthrough branch; the \"/\" anchor is not holding")
 	}
 }
