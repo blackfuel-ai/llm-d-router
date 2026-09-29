@@ -626,3 +626,51 @@ func TestGenerateResponseBodyResponses_DynamicMetadata(t *testing.T) {
 		})
 	}
 }
+
+// A model server that reports cumulative usage on every streamed chunk (vLLM with
+// --enable-force-include-usage) still yields one token observation per request, carrying
+// the final totals.
+func TestHandleResponseBody_CumulativeStreamingUsageObservedOncePerRequest(t *testing.T) {
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	eppmetrics.Register()
+	eppmetrics.Reset()
+	t.Cleanup(eppmetrics.Reset)
+
+	server := &StreamingServer{
+		parserRegistry: NewParserRegistry([]fwkrh.Parser{openai.NewOpenAIParser()}, logr.Discard()),
+		director:       &mockDirector{},
+	}
+	reqCtx := &RequestContext{
+		IncomingModelName: "cumulative-model",
+		TargetModelName:   "cumulative-target",
+		Response: &Response{
+			Headers: map[string]string{"content-type": "text/event-stream"},
+		},
+		SchedulingRequest: &fwksched.InferenceRequest{FairnessID: metadata.DefaultFairnessID},
+	}
+
+	chunks := []string{
+		`data: {"choices":[{"delta":{"content":"a"}}],"usage":{"prompt_tokens":100,"completion_tokens":1,"total_tokens":101,"prompt_tokens_details":{"cached_tokens":40}}}` + "\n\n",
+		`data: {"choices":[{"delta":{"content":"b"}}],"usage":{"prompt_tokens":100,"completion_tokens":2,"total_tokens":102,"prompt_tokens_details":{"cached_tokens":40}}}` + "\n\n",
+		`data: {"choices":[{"delta":{"content":"c"}}],"usage":{"prompt_tokens":100,"completion_tokens":3,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":40}}}` + "\n\n",
+		`data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":3,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":40}}}` + "\n\n",
+		`data: [DONE]` + "\n\n",
+	}
+	for i, chunk := range chunks {
+		server.HandleResponseBody(ctx, reqCtx, []byte(chunk), i == len(chunks)-1)
+	}
+
+	labels := map[string]string{
+		"model_name":        "cumulative-model",
+		"target_model_name": "cumulative-target",
+	}
+	for name, wantSum := range map[string]float64{
+		"llm_d_epp_request_input_tokens":  100,
+		"llm_d_epp_request_output_tokens": 3,
+		"llm_d_epp_request_cached_tokens": 40,
+	} {
+		histogram := findHistogramMetric(t, name, labels)
+		assert.Equal(t, uint64(1), histogram.GetSampleCount(), "%s observed once per request", name)
+		assert.Equal(t, wantSum, histogram.GetSampleSum(), "%s carries the final totals", name)
+	}
+}

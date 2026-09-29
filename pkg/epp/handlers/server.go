@@ -213,6 +213,8 @@ type RequestContext struct {
 	RequestState         StreamRequestState
 	RequestDroppedReason errcommon.RequestDroppedReason
 	modelServerStreaming bool
+	// usageReported is true once any response chunk carried a usage object.
+	usageReported bool
 
 	// responseProcessingDuration is the EPP cost of handling the response. For a
 	// streamed response it is the sum of the per-chunk handler slices, since the
