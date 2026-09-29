@@ -79,13 +79,19 @@ func (s *StreamingServer) HandleResponseBody(ctx context.Context, reqCtx *Reques
 	}
 	if parsedResp != nil && parsedResp.Usage != nil {
 		reqCtx.Usage = *parsedResp.Usage
-		metrics.RecordInputTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.Usage.PromptTokens)
-		metrics.RecordOutputTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.Usage.CompletionTokens)
-		if reqCtx.Usage.PromptTokenDetails != nil {
-			metrics.RecordPromptCachedTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.Usage.PromptTokenDetails.CachedTokens)
-		}
+		reqCtx.usageReported = true
 	}
 	if endOfStream {
+		// Token counts are observed once per request, from the last usage the model server
+		// reported. A server that reports cumulative usage on every streamed chunk (vLLM with
+		// --enable-force-include-usage) would otherwise be observed once per chunk.
+		if reqCtx.usageReported {
+			metrics.RecordInputTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.Usage.PromptTokens)
+			metrics.RecordOutputTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.Usage.CompletionTokens)
+			if reqCtx.Usage.PromptTokenDetails != nil {
+				metrics.RecordPromptCachedTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.Usage.PromptTokenDetails.CachedTokens)
+			}
+		}
 		metrics.RecordNormalizedTimePerOutputToken(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.RequestReceivedTimestamp, reqCtx.ResponseCompleteTimestamp, reqCtx.Usage.CompletionTokens)
 		metrics.RecordRequestLatencies(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.RequestReceivedTimestamp, reqCtx.ResponseCompleteTimestamp)
 		metrics.RecordResponseSizes(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.ResponseSize)
