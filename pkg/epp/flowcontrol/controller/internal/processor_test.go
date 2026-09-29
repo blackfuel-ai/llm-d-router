@@ -295,6 +295,48 @@ func (h *testHarness) fairnessPolicy(p int) (flowcontrol.FairnessPolicy, error) 
 	return policy, nil
 }
 
+// TestProcessorDropsUnpartitionedDetectorSeries asserts on the process-global detector saturation gauge, whose stage
+// series any dispatch cycle deletes by stage across every detector (an empty partition drops that stage's series). It
+// therefore runs as a serial top-level test, which never overlaps the package's parallel tests.
+func TestProcessorDropsUnpartitionedDetectorSeries(t *testing.T) {
+	metrics.Register()
+	h := newTestHarness(t, testCleanupTick)
+	const detector = "unpartitioned-series-test"
+
+	h.saturationDetector.SaturationFunc = func(ctx context.Context, _ []fwkdl.Endpoint) float64 {
+		metrics.RecordFlowControlDetectorSaturation(detector, flowcontrol.SaturationStageFromContext(ctx), 1.0)
+		return 1.0
+	}
+
+	// Empty pool: the detector is evaluated without a stage.
+	h.endpointCandidates.Candidates = nil
+	h.processor.dispatchCycle(context.Background())
+
+	h.endpointCandidates.Candidates = []fwkdl.Endpoint{fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
+		Labels: map[string]string{bylabel.RoleLabel: bylabel.RoleDecode},
+	}, nil)}
+	h.processor.dispatchCycle(context.Background())
+
+	families, err := ctrlmetrics.Registry.Gather()
+	require.NoError(t, err)
+	var stages []string
+	for _, mf := range families {
+		if mf.GetName() != "llm_d_epp_flow_control_detector_saturation" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			if labels["detector"] == detector {
+				stages = append(stages, labels["stage"])
+			}
+		}
+	}
+	assert.Equal(t, []string{"decode"}, stages, "only the decode series should remain")
+}
+
 // TestProcessor contains all tests for the `Processor`.
 func TestProcessor(t *testing.T) {
 	t.Parallel()
@@ -1300,44 +1342,6 @@ func TestProcessor(t *testing.T) {
 
 				dispatched := h.processor.dispatchCycle(context.Background())
 				assert.True(t, dispatched, "should dispatch when only non-empty partitions are healthy")
-			})
-
-			t.Run("should drop unpartitioned detector series once stages are evaluated", func(t *testing.T) {
-				t.Parallel()
-				metrics.Register()
-				h := newTestHarness(t, testCleanupTick)
-				const detector = "unpartitioned-series-test"
-
-				h.saturationDetector.SaturationFunc = func(ctx context.Context, _ []fwkdl.Endpoint) float64 {
-					metrics.RecordFlowControlDetectorSaturation(detector, flowcontrol.SaturationStageFromContext(ctx), 1.0)
-					return 1.0
-				}
-
-				// Empty pool: the detector is evaluated without a stage.
-				h.endpointCandidates.Candidates = nil
-				h.processor.dispatchCycle(context.Background())
-
-				h.endpointCandidates.Candidates = []fwkdl.Endpoint{makeEndpoint(bylabel.RoleDecode)}
-				h.processor.dispatchCycle(context.Background())
-
-				families, err := ctrlmetrics.Registry.Gather()
-				require.NoError(t, err)
-				var stages []string
-				for _, mf := range families {
-					if mf.GetName() != "llm_d_epp_flow_control_detector_saturation" {
-						continue
-					}
-					for _, m := range mf.GetMetric() {
-						labels := map[string]string{}
-						for _, lp := range m.GetLabel() {
-							labels[lp.GetName()] = lp.GetValue()
-						}
-						if labels["detector"] == detector {
-							stages = append(stages, labels["stage"])
-						}
-					}
-				}
-				assert.Equal(t, []string{"decode"}, stages, "only the decode series should remain")
 			})
 
 			t.Run("should include interleaved endpoints in both stage pools", func(t *testing.T) {
