@@ -20,6 +20,7 @@ package metrics
 import (
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 
@@ -132,12 +133,13 @@ func (spec *Spec) getLatestMetric(families sourcemetrics.PrometheusMetricMap) (*
 type aggregation int
 
 const (
-	aggregateMean aggregation = iota
+	aggregateSum aggregation = iota
 	aggregateMax
 )
 
 // aggregateMetric folds every series matching Spec into one value, so a pod
-// exposing one series per engine reports all of its engines.
+// exposing one series per engine reports all of its engines. A non-finite
+// value on any matching series fails the whole family.
 func (spec *Spec) aggregateMetric(families sourcemetrics.PrometheusMetricMap, agg aggregation) (float64, error) {
 	family, err := extractFamily(spec, families)
 	if err != nil {
@@ -152,10 +154,13 @@ func (spec *Spec) aggregateMetric(families sourcemetrics.PrometheusMetricMap, ag
 			continue
 		}
 		value := extractValue(metric)
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return 0, fmt.Errorf("non-finite metric value %v for %q", value, spec.Name)
+		}
 		switch {
 		case matched == 0:
 			result = value
-		case agg == aggregateMean:
+		case agg == aggregateSum:
 			result += value
 		case value > result:
 			result = value
@@ -165,10 +170,6 @@ func (spec *Spec) aggregateMetric(families sourcemetrics.PrometheusMetricMap, ag
 
 	if matched == 0 {
 		return 0, fmt.Errorf("no matching metric found for %q with labels %v", spec.Name, spec.Labels)
-	}
-
-	if agg == aggregateMean {
-		result /= float64(matched)
 	}
 	return result, nil
 }

@@ -20,6 +20,7 @@ package metrics
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -362,22 +363,27 @@ func TestExtractorReadsEveryEngineOfDataParallelPod(t *testing.T) {
 		return &dto.MetricFamily{Type: dto.MetricType_GAUGE.Enum(), Metric: series}
 	}
 
+	fourEngines := sourcemetrics.PrometheusMetricMap{
+		defaultTotalQueuedRequestsMetric:    perEngine(6, 10, 11, 7),
+		defaultTotalRunningRequestsMetric:   perEngine(40, 38, 41, 37),
+		defaultKvCacheUsagePercentageMetric: perEngine(0.52, 0.91, 0.78, 0.60),
+	}
+
 	tests := []struct {
-		name        string
+		name string
+		// previous, when set, is extracted first so the test can check which fields a failed scrape keeps.
+		previous    sourcemetrics.PrometheusMetricMap
 		data        sourcemetrics.PrometheusMetricMap
+		wantErr     bool
 		wantWaiting int
 		wantRunning int
 		wantKV      float64
 	}{
 		{
-			name: "four engines",
-			data: sourcemetrics.PrometheusMetricMap{
-				defaultTotalQueuedRequestsMetric:    perEngine(6, 10, 11, 7),
-				defaultTotalRunningRequestsMetric:   perEngine(40, 38, 41, 37),
-				defaultKvCacheUsagePercentageMetric: perEngine(0.52, 0.91, 0.78, 0.60),
-			},
-			wantWaiting: 11,
-			wantRunning: 39,
+			name:        "four engines",
+			data:        fourEngines,
+			wantWaiting: 34,
+			wantRunning: 156,
 			wantKV:      0.91,
 		},
 		{
@@ -391,13 +397,32 @@ func TestExtractorReadsEveryEngineOfDataParallelPod(t *testing.T) {
 			wantRunning: 40,
 			wantKV:      0.52,
 		},
+		{
+			name:     "non-finite engine keeps the previous value",
+			previous: fourEngines,
+			data: sourcemetrics.PrometheusMetricMap{
+				defaultTotalQueuedRequestsMetric:    perEngine(1, math.NaN(), 2, 3),
+				defaultTotalRunningRequestsMetric:   perEngine(10, 20, 30, 40),
+				defaultKvCacheUsagePercentageMetric: perEngine(0.1, 0.2, 0.3, 0.4),
+			},
+			wantErr:     true,
+			wantWaiting: 34,
+			wantRunning: 100,
+			wantKV:      0.4,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ep := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{}, nil)
-			if err := extractor.Extract(ctx, fwkdl.PollInput[sourcemetrics.PrometheusMetricMap]{Payload: tt.data, Endpoint: ep}); err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			if tt.previous != nil {
+				if err := extractor.Extract(ctx, fwkdl.PollInput[sourcemetrics.PrometheusMetricMap]{Payload: tt.previous, Endpoint: ep}); err != nil {
+					t.Fatalf("unexpected error on previous scrape: %v", err)
+				}
+			}
+			err := extractor.Extract(ctx, fwkdl.PollInput[sourcemetrics.PrometheusMetricMap]{Payload: tt.data, Endpoint: ep})
+			if gotErr := err != nil; gotErr != tt.wantErr {
+				t.Fatalf("Extract error: want error %v, got %v", tt.wantErr, err)
 			}
 			got := ep.GetMetrics()
 			if got.WaitingQueueSize != tt.wantWaiting {
