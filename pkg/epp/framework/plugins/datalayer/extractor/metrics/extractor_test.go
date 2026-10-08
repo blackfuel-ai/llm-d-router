@@ -335,6 +335,67 @@ func TestBuiltinAtomEngine(t *testing.T) {
 	}
 }
 
+// TestBuiltinSGLangDataParallel uses the label set SGLang puts on scheduler
+// metrics, with one series per dp_rank.
+func TestBuiltinSGLangDataParallel(t *testing.T) {
+	ctx := context.Background()
+
+	extractor, err := newCoreMetricsExtractorPlugin(ctx, "sglang-test", &modelServerExtractorParams{
+		DefaultEngine: "sglang",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	perDPRank := func(values ...float64) *dto.MetricFamily {
+		series := make([]*dto.Metric, 0, len(values))
+		for rank, v := range values {
+			series = append(series, &dto.Metric{
+				Label: []*dto.LabelPair{
+					{Name: proto.String("model_name"), Value: proto.String("m")},
+					{Name: proto.String("engine_type"), Value: proto.String("unified")},
+					{Name: proto.String("tp_rank"), Value: proto.String("0")},
+					{Name: proto.String("pp_rank"), Value: proto.String("0")},
+					{Name: proto.String("moe_ep_rank"), Value: proto.String("0")},
+					{Name: proto.String("dp_rank"), Value: proto.String(strconv.Itoa(rank))},
+				},
+				Gauge: &dto.Gauge{Value: ptr.To(v)},
+			})
+		}
+		return &dto.MetricFamily{Type: dto.MetricType_GAUGE.Enum(), Metric: series}
+	}
+
+	data := sourcemetrics.PrometheusMetricMap{
+		"sglang:num_queue_reqs":   perDPRank(3, 5),
+		"sglang:num_running_reqs": perDPRank(20, 24),
+		"sglang:token_usage":      perDPRank(0.4, 0.7),
+		"sglang:page_size":        perDPRank(16, 16),
+		"sglang:num_pages":        perDPRank(1000, 1000),
+	}
+
+	ep := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
+		Labels: map[string]string{DefaultEngineTypeLabelKey: "sglang"},
+	}, nil)
+
+	if err := extractor.Extract(ctx, fwkdl.PollInput[sourcemetrics.PrometheusMetricMap]{
+		Payload:  data,
+		Endpoint: ep,
+	}); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	metrics := ep.GetMetrics()
+	if metrics.WaitingQueueSize != 8 {
+		t.Errorf("WaitingQueueSize = %v, want 8", metrics.WaitingQueueSize)
+	}
+	if metrics.RunningRequestsSize != 44 {
+		t.Errorf("RunningRequestsSize = %v, want 44", metrics.RunningRequestsSize)
+	}
+	if metrics.KVCacheUsagePercent != 0.7 {
+		t.Errorf("KVCacheUsagePercent = %v, want 0.7", metrics.KVCacheUsagePercent)
+	}
+}
+
 func TestExtractorReadsEveryEngineOfDataParallelPod(t *testing.T) {
 	ctx := context.Background()
 

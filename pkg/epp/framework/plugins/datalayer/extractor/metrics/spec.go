@@ -142,8 +142,10 @@ const (
 )
 
 // aggregateMetric folds every series matching Spec into one value, so a pod
-// exposing one series per engine reports all of its engines. A non-finite
-// value on any matching series fails the whole family.
+// exposing one series per engine reports all of its engines. A Spec without
+// Labels matches every series of the family, so each series must describe a
+// distinct engine. A non-finite value on any matching series fails the whole
+// family.
 func (spec *Spec) aggregateMetric(families sourcemetrics.PrometheusMetricMap, agg aggregation) (float64, error) {
 	family, err := extractFamily(spec, families)
 	if err != nil {
