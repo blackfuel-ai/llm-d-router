@@ -125,6 +125,10 @@ func (spec *Spec) getLatestMetric(families sourcemetrics.PrometheusMetricMap) (*
 		return nil, fmt.Errorf("no matching metric found for %q with labels %v", spec.Name, spec.Labels)
 	}
 
+	if v := extractValue(latest); math.IsNaN(v) || math.IsInf(v, 0) {
+		return nil, fmt.Errorf("non-finite metric value %v for %q", v, spec.Name)
+	}
+
 	return latest, nil
 }
 

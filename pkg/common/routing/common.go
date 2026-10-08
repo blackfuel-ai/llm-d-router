@@ -40,7 +40,7 @@ const (
 	// instead of recomputing them
 	KVCacheSourceHeader = "x-kv-cache-source-host-port"
 
-	// InferencePoolAPIGroup is the default InferencePool API group
+	// InferencePoolAPIGroup is the InferencePool API group
 	InferencePoolAPIGroup = "inference.networking.k8s.io"
 
 	// PreferHeader is the standard HTTP "Prefer" header (RFC 7240). EPP
@@ -64,19 +64,35 @@ func StripScheme(endpoint string) string {
 	return u.Host
 }
 
-// IsConditionalDecode reports whether the request headers carry the
-// "Prefer: if-available" preference (see PreferIfAvailable for semantics).
+// HasPreference reports whether the request headers carry the given Prefer
+// token.
 //
-// Per RFC 7240 the Prefer header value is a comma-separated list of preference
-// tokens, each with optional ";"-delimited parameters. This function matches
-// the bare "if-available" token case-insensitively, ignoring surrounding
-// whitespace, parameters, and any other tokens that may appear alongside it.
-func IsConditionalDecode(headers map[string]string) bool {
-	for _, pref := range strings.Split(headers[PreferHeader], ",") {
+// Per RFC 7240 the Prefer header value is a comma-separated list of
+// preferences. Each preference is a token with an optional "=" value and
+// optional ";"-delimited parameters. This function matches the token
+// case-insensitively, ignoring whitespace around both the parsed token and
+// want, the value, parameters, and any other tokens that may appear alongside
+// it. For example, "return=minimal" matches the token "return". A want that is
+// empty or only whitespace always returns false. Quoted-string values that
+// contain "," or ";" are not supported.
+func HasPreference(headers map[string]string, want string) bool {
+	prefer := headers[PreferHeader]
+	want = strings.TrimSpace(want)
+	if prefer == "" || want == "" {
+		return false
+	}
+	for pref := range strings.SplitSeq(prefer, ",") {
 		token, _, _ := strings.Cut(pref, ";")
-		if strings.EqualFold(strings.TrimSpace(token), PreferIfAvailable) {
+		token, _, _ = strings.Cut(token, "=")
+		if strings.EqualFold(strings.TrimSpace(token), want) {
 			return true
 		}
 	}
 	return false
+}
+
+// IsConditionalDecode reports whether the request headers carry the
+// "Prefer: if-available" preference (see PreferIfAvailable for semantics).
+func IsConditionalDecode(headers map[string]string) bool {
+	return HasPreference(headers, PreferIfAvailable)
 }
