@@ -129,8 +129,11 @@ var (
 			Subsystem: LLMDRouterEndpointPickerSubsystem,
 			Name:      "request_ntpot_seconds",
 			Help:      metricsutil.HelpMsgWithStability("Normalized time per output token in seconds (end-to-end latency divided by output token count).", compbasemetrics.ALPHA),
+			// Boundaries at 25, 30 and 40 ms sit on the output-speed floors sold
+			// per traffic class (agentic, coding, general), so a per-band
+			// share-above-floor is bucket-exact at each of them.
 			Buckets: []float64{
-				0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
+				0.001, 0.002, 0.005, 0.01, 0.02, 0.025, 0.03, 0.04, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
 			},
 		},
 		modelLabelsWithFairnessPriority,
