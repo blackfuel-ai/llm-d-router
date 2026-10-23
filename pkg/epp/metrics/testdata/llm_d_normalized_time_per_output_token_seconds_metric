@@ -5,6 +5,9 @@ llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.002",model_n
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.005",model_name="m10",priority="3",target_model_name="t10"} 0
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.01",model_name="m10",priority="3",target_model_name="t10"} 1
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.02",model_name="m10",priority="3",target_model_name="t10"} 2
+llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.025",model_name="m10",priority="3",target_model_name="t10"} 2
+llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.03",model_name="m10",priority="3",target_model_name="t10"} 2
+llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.04",model_name="m10",priority="3",target_model_name="t10"} 2
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.05",model_name="m10",priority="3",target_model_name="t10"} 2
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.1",model_name="m10",priority="3",target_model_name="t10"} 2
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.2",model_name="m10",priority="3",target_model_name="t10"} 2
@@ -21,6 +24,9 @@ llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.002",model_n
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.005",model_name="m10",priority="3",target_model_name="t11"} 0
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.01",model_name="m10",priority="3",target_model_name="t11"} 0
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.02",model_name="m10",priority="3",target_model_name="t11"} 1
+llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.025",model_name="m10",priority="3",target_model_name="t11"} 1
+llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.03",model_name="m10",priority="3",target_model_name="t11"} 1
+llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.04",model_name="m10",priority="3",target_model_name="t11"} 1
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.05",model_name="m10",priority="3",target_model_name="t11"} 1
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.1",model_name="m10",priority="3",target_model_name="t11"} 1
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.2",model_name="m10",priority="3",target_model_name="t11"} 1
@@ -37,6 +43,9 @@ llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.002",model_n
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.005",model_name="m20",priority="3",target_model_name="t20"} 0
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.01",model_name="m20",priority="3",target_model_name="t20"} 1
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.02",model_name="m20",priority="3",target_model_name="t20"} 1
+llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.025",model_name="m20",priority="3",target_model_name="t20"} 1
+llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.03",model_name="m20",priority="3",target_model_name="t20"} 1
+llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.04",model_name="m20",priority="3",target_model_name="t20"} 1
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.05",model_name="m20",priority="3",target_model_name="t20"} 1
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.1",model_name="m20",priority="3",target_model_name="t20"} 1
 llm_d_epp_request_ntpot_seconds_bucket{fairness_id="tenant-a",le="0.2",model_name="m20",priority="3",target_model_name="t20"} 1
